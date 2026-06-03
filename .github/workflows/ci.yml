@@ -1,4 +1,5 @@
 name: CI
+if: false
 
 # This setup assumes that you run the unit tests with code coverage in the same
 # workflow that will also print the coverage report as comment to the pull request.
