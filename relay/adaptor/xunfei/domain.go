@@ -3,7 +3,18 @@ package xunfei
 import (
 	"fmt"
 	"strings"
+
+	"github.com/songquanpeng/one-api/common/config"
 )
+
+// getXunfeiHost returns the configured xunfei API host, falling back to the
+// official endpoint when XUNFEI_API_HOST is not set.
+func getXunfeiHost() string {
+	if config.XunfeiAPIHost != "" {
+		return config.XunfeiAPIHost
+	}
+	return "spark-api.xf-yun.com"
+}
 
 // https://www.xfyun.cn/doc/spark/Web.html#_1-%E6%8E%A5%E5%8F%A3%E8%AF%B4%E6%98%8E
 
@@ -83,15 +94,16 @@ func apiVersion2domain(apiVersion string) string {
 func getXunfeiAuthUrl(apiVersion string, apiKey string, apiSecret string) (string, string) {
 	var authUrl string
 	domain := apiVersion2domain(apiVersion)
+	host := getXunfeiHost()
 	switch apiVersion {
 	case "v3.1-128K":
-		authUrl = buildXunfeiAuthUrl(fmt.Sprintf("wss://spark-api.xf-yun.com/chat/pro-128k"), apiKey, apiSecret)
+		authUrl = buildXunfeiAuthUrl(fmt.Sprintf("wss://%s/chat/pro-128k", host), apiKey, apiSecret)
 		break
 	case "v3.5-32K":
-		authUrl = buildXunfeiAuthUrl(fmt.Sprintf("wss://spark-api.xf-yun.com/chat/max-32k"), apiKey, apiSecret)
+		authUrl = buildXunfeiAuthUrl(fmt.Sprintf("wss://%s/chat/max-32k", host), apiKey, apiSecret)
 		break
 	default:
-		authUrl = buildXunfeiAuthUrl(fmt.Sprintf("wss://spark-api.xf-yun.com/%s/chat", apiVersion), apiKey, apiSecret)
+		authUrl = buildXunfeiAuthUrl(fmt.Sprintf("wss://%s/%s/chat", host, apiVersion), apiKey, apiSecret)
 	}
 	return domain, authUrl
 }

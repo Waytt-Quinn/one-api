@@ -62,6 +62,10 @@ var LogConsumeEnabled = true
 
 var XunfeiCookie = os.Getenv("XUNFEI_COOKIE")
 
+// XunfeiAPIHost overrides the default xunfei API host. Empty means use the
+// official endpoint (spark-api.xf-yun.com).
+var XunfeiAPIHost = os.Getenv("XUNFEI_API_HOST")
+
 var SMTPServer = ""
 var SMTPPort = 587
 var SMTPAccount = ""
