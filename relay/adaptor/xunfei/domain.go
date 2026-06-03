@@ -16,6 +16,12 @@ func getXunfeiHost() string {
 	return "spark-api.xf-yun.com"
 }
 
+// getXunfeiPathPrefix returns the configured xunfei path prefix (without
+// trailing slash), or an empty string when XUNFEI_API_PATH_PREFIX is unset.
+func getXunfeiPathPrefix() string {
+	return strings.TrimRight(config.XunfeiAPIPathPrefix, "/")
+}
+
 // https://www.xfyun.cn/doc/spark/Web.html#_1-%E6%8E%A5%E5%8F%A3%E8%AF%B4%E6%98%8E
 
 //Spark4.0 Ultra 请求地址，对应的domain参数为4.0Ultra：
@@ -95,15 +101,16 @@ func getXunfeiAuthUrl(apiVersion string, apiKey string, apiSecret string) (strin
 	var authUrl string
 	domain := apiVersion2domain(apiVersion)
 	host := getXunfeiHost()
+	prefix := getXunfeiPathPrefix()
 	switch apiVersion {
 	case "v3.1-128K":
-		authUrl = buildXunfeiAuthUrl(fmt.Sprintf("wss://%s/chat/pro-128k", host), apiKey, apiSecret)
+		authUrl = buildXunfeiAuthUrl(fmt.Sprintf("wss://%s%s/chat/pro-128k", host, prefix), apiKey, apiSecret)
 		break
 	case "v3.5-32K":
-		authUrl = buildXunfeiAuthUrl(fmt.Sprintf("wss://%s/chat/max-32k", host), apiKey, apiSecret)
+		authUrl = buildXunfeiAuthUrl(fmt.Sprintf("wss://%s%s/chat/max-32k", host, prefix), apiKey, apiSecret)
 		break
 	default:
-		authUrl = buildXunfeiAuthUrl(fmt.Sprintf("wss://%s/%s/chat", host, apiVersion), apiKey, apiSecret)
+		authUrl = buildXunfeiAuthUrl(fmt.Sprintf("wss://%s%s/%s/chat", host, prefix, apiVersion), apiKey, apiSecret)
 	}
 	return domain, authUrl
 }

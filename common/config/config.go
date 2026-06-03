@@ -66,6 +66,11 @@ var XunfeiCookie = os.Getenv("XUNFEI_COOKIE")
 // official endpoint (spark-api.xf-yun.com).
 var XunfeiAPIHost = os.Getenv("XUNFEI_API_HOST")
 
+// XunfeiAPIPathPrefix is prepended to the path component when building the
+// xunfei WebSocket URL. Useful when routing through a reverse proxy that
+// exposes the upstream under a sub-path. Empty disables the prefix.
+var XunfeiAPIPathPrefix = os.Getenv("XUNFEI_API_PATH_PREFIX")
+
 var SMTPServer = ""
 var SMTPPort = 587
 var SMTPAccount = ""
