@@ -77,6 +77,11 @@ var XunfeiAPIPathPrefix = os.Getenv("XUNFEI_API_PATH_PREFIX")
 // the path is built from the model-specific apiVersion.
 var XunfeiAPIPath = os.Getenv("XUNFEI_API_PATH")
 
+// XunfeiInsecureSkipVerify, when set to "true", disables TLS certificate
+// verification on the xunfei WebSocket dial. Use only for self-signed
+// certificates on trusted internal networks.
+var XunfeiInsecureSkipVerify = strings.ToLower(os.Getenv("XUNFEI_INSECURE_SKIP_VERIFY")) == "true"
+
 var SMTPServer = ""
 var SMTPPort = 587
 var SMTPAccount = ""

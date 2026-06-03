@@ -3,6 +3,7 @@ package xunfei
 import (
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -225,6 +226,7 @@ func Handler(c *gin.Context, meta *meta.Meta, textRequest model.GeneralOpenAIReq
 func xunfeiMakeRequest(textRequest model.GeneralOpenAIRequest, domain, authUrl, appId string) (chan ChatResponse, chan bool, error) {
 	d := websocket.Dialer{
 		HandshakeTimeout: 5 * time.Second,
+		TLSClientConfig:   &tls.Config{InsecureSkipVerify: config.XunfeiInsecureSkipVerify},
 	}
 	var requestHeader http.Header
 	if config.XunfeiCookie != "" {
