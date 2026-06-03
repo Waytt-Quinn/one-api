@@ -22,6 +22,12 @@ func getXunfeiPathPrefix() string {
 	return strings.TrimRight(config.XunfeiAPIPathPrefix, "/")
 }
 
+// getXunfeiPath returns the configured full path override, or an empty
+// string when XUNFEI_API_PATH is unset.
+func getXunfeiPath() string {
+	return config.XunfeiAPIPath
+}
+
 // https://www.xfyun.cn/doc/spark/Web.html#_1-%E6%8E%A5%E5%8F%A3%E8%AF%B4%E6%98%8E
 
 //Spark4.0 Ultra 请求地址，对应的domain参数为4.0Ultra：
@@ -101,6 +107,11 @@ func getXunfeiAuthUrl(apiVersion string, apiKey string, apiSecret string) (strin
 	var authUrl string
 	domain := apiVersion2domain(apiVersion)
 	host := getXunfeiHost()
+	overridePath := getXunfeiPath()
+	if overridePath != "" {
+		authUrl = buildXunfeiAuthUrl(fmt.Sprintf("wss://%s%s", host, overridePath), apiKey, apiSecret)
+		return domain, authUrl
+	}
 	prefix := getXunfeiPathPrefix()
 	switch apiVersion {
 	case "v3.1-128K":

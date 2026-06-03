@@ -71,6 +71,12 @@ var XunfeiAPIHost = os.Getenv("XUNFEI_API_HOST")
 // exposes the upstream under a sub-path. Empty disables the prefix.
 var XunfeiAPIPathPrefix = os.Getenv("XUNFEI_API_PATH_PREFIX")
 
+// XunfeiAPIPath, when set, fully overrides the path component (must start
+// with "/") of the xunfei WebSocket URL for every model. Use this when the
+// upstream exposes a single fixed endpoint regardless of model. When empty,
+// the path is built from the model-specific apiVersion.
+var XunfeiAPIPath = os.Getenv("XUNFEI_API_PATH")
+
 var SMTPServer = ""
 var SMTPPort = 587
 var SMTPAccount = ""
