@@ -66,7 +66,7 @@ func requestOpenAI2Xunfei(request model.GeneralOpenAIRequest, xunfeiAppId string
 	xunfeiRequest.Payload.SessionId = ""
 	xunfeiRequest.Payload.Message.Text = messages
 
-	if strings.HasPrefix(xunfeiRequest.Parameter.Chat.Domain, "generalv3") || xunfeiRequest.Parameter.Chat.Domain == "4.0Ultra" {
+	if len(request.Tools) > 0 && (config.XunfeiDomain != "" || strings.HasPrefix(xunfeiRequest.Parameter.Chat.Domain, "generalv3") || xunfeiRequest.Parameter.Chat.Domain == "4.0Ultra") {
 		functions := make([]model.Function, len(request.Tools))
 		for i, tool := range request.Tools {
 			functions[i] = tool.Function
@@ -136,7 +136,12 @@ func streamResponseXunfei2OpenAI(xunfeiResponse *ChatResponse) *openai.ChatCompl
 	choice.Delta.Content = xunfeiResponse.Payload.Choices.Text[0].Content
 	choice.Delta.ToolCalls = getToolCalls(xunfeiResponse)
 	if xunfeiResponse.Payload.Choices.Status == 2 {
-		choice.FinishReason = &constant.StopFinishReason
+		finishReason := constant.StopFinishReason
+		if len(choice.Delta.ToolCalls) > 0 {
+			toolFinish := "tool_calls"
+			finishReason = &toolFinish
+		}
+		choice.FinishReason = finishReason
 	}
 	response := openai.ChatCompletionsStreamResponse{
 		Id:      fmt.Sprintf("chatcmpl-%s", random.GetUUID()),
