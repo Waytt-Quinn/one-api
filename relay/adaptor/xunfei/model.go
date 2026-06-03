@@ -5,8 +5,9 @@ import (
 )
 
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role        string `json:"role,omitempty"`
+	Content     string `json:"content"`
+	ContentType string `json:"content_type,omitempty"`
 }
 
 type Functions struct {
@@ -15,19 +16,23 @@ type Functions struct {
 
 type ChatRequest struct {
 	Header struct {
-		AppId string `json:"app_id"`
+		AppId   string `json:"app_id,omitempty"`
+		TraceId string `json:"traceId,omitempty"`
+		Mode    int    `json:"mode,omitempty"`
 	} `json:"header"`
 	Parameter struct {
 		Chat struct {
-			Domain      string   `json:"domain,omitempty"`
-			Temperature *float64 `json:"temperature,omitempty"`
-			TopK        int      `json:"top_k,omitempty"`
-			MaxTokens   int      `json:"max_tokens,omitempty"`
-			Auditing    bool     `json:"auditing,omitempty"`
+			Domain         string   `json:"domain,omitempty"`
+			Temperature    *float64 `json:"temperature,omitempty"`
+			TopK           int      `json:"top_k,omitempty"`
+			MaxTokens      int      `json:"max_tokens,omitempty"`
+			Auditing       bool     `json:"auditing,omitempty"`
+			ContextEnabled *bool    `json:"contextEnabled,omitempty"`
 		} `json:"chat"`
 	} `json:"parameter"`
 	Payload struct {
-		Message struct {
+		SessionId string `json:"sessionId,omitempty"`
+		Message   struct {
 			Text []Message `json:"text"`
 		} `json:"message"`
 		Functions *Functions `json:"functions,omitempty"`

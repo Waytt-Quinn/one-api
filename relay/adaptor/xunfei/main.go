@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,19 +36,37 @@ func requestOpenAI2Xunfei(request model.GeneralOpenAIRequest, xunfeiAppId string
 	messages := make([]Message, 0, len(request.Messages))
 	for _, message := range request.Messages {
 		messages = append(messages, Message{
-			Role:    message.Role,
-			Content: message.StringContent(),
+			Role:        message.Role,
+			Content:     message.StringContent(),
+			ContentType: "text",
 		})
 	}
 	xunfeiRequest := ChatRequest{}
 	xunfeiRequest.Header.AppId = xunfeiAppId
-	xunfeiRequest.Parameter.Chat.Domain = domain
+	xunfeiRequest.Header.TraceId = random.GetUUID()
+	xunfeiRequest.Header.Mode = 0
+	if config.XunfeiDomain != "" {
+		xunfeiRequest.Parameter.Chat.Domain = config.XunfeiDomain
+	} else {
+		xunfeiRequest.Parameter.Chat.Domain = domain
+	}
 	xunfeiRequest.Parameter.Chat.Temperature = request.Temperature
-	xunfeiRequest.Parameter.Chat.TopK = request.N
+	if config.XunfeiTopK != "" {
+		if n, err := strconv.Atoi(config.XunfeiTopK); err == nil {
+			xunfeiRequest.Parameter.Chat.TopK = n
+		}
+	} else if request.N != 0 {
+		xunfeiRequest.Parameter.Chat.TopK = request.N
+	}
 	xunfeiRequest.Parameter.Chat.MaxTokens = request.MaxTokens
+	if config.XunfeiContextEnabled != "" {
+		b := strings.ToLower(config.XunfeiContextEnabled) == "true"
+		xunfeiRequest.Parameter.Chat.ContextEnabled = &b
+	}
+	xunfeiRequest.Payload.SessionId = ""
 	xunfeiRequest.Payload.Message.Text = messages
 
-	if strings.HasPrefix(domain, "generalv3") || domain == "4.0Ultra" {
+	if strings.HasPrefix(xunfeiRequest.Parameter.Chat.Domain, "generalv3") || xunfeiRequest.Parameter.Chat.Domain == "4.0Ultra" {
 		functions := make([]model.Function, len(request.Tools))
 		for i, tool := range request.Tools {
 			functions[i] = tool.Function
