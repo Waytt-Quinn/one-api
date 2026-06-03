@@ -17,6 +17,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/songquanpeng/one-api/common"
+	"github.com/songquanpeng/one-api/common/config"
 	"github.com/songquanpeng/one-api/common/helper"
 	"github.com/songquanpeng/one-api/common/logger"
 	"github.com/songquanpeng/one-api/common/random"
@@ -225,7 +226,12 @@ func xunfeiMakeRequest(textRequest model.GeneralOpenAIRequest, domain, authUrl, 
 	d := websocket.Dialer{
 		HandshakeTimeout: 5 * time.Second,
 	}
-	conn, resp, err := d.Dial(authUrl, nil)
+	var requestHeader http.Header
+	if config.XunfeiCookie != "" {
+		requestHeader = http.Header{}
+		requestHeader.Set("Cookie", config.XunfeiCookie)
+	}
+	conn, resp, err := d.Dial(authUrl, requestHeader)
 	if err != nil || resp.StatusCode != 101 {
 		return nil, nil, err
 	}

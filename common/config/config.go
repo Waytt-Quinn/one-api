@@ -60,6 +60,8 @@ var MemoryCacheEnabled = strings.ToLower(os.Getenv("MEMORY_CACHE_ENABLED")) == "
 
 var LogConsumeEnabled = true
 
+var XunfeiCookie = os.Getenv("XUNFEI_COOKIE")
+
 var SMTPServer = ""
 var SMTPPort = 587
 var SMTPAccount = ""
