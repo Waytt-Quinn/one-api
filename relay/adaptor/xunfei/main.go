@@ -11,7 +11,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -98,37 +97,32 @@ func getToolCalls(response *ChatResponse) []model.Tool {
 	return extractXMLToolCalls(item.Content)
 }
 
-// xmlToolCallPattern matches a fully-closed XML block emitted as a tool
-// invocation by models that prefer XML over the structured function_call
-// field, e.g. "<read_file>...</read_file>".
-var xmlToolCallPattern = regexp.MustCompile(`(?s)<([A-Za-z][A-Za-z0-9_-]*)>\s*(.*?)\s*</\1>`)
-
 // knownXMLToolNames are tag names we recognise as tool invocations. The
 // model may emit tool tags it invented (e.g. <bash>); we accept any tag
-// matching the regex above and emit a function_call whose name is the
-// tag itself.
+// matching the simple state-machine extractor and emit a function_call
+// whose name is the tag itself.
 var knownXMLToolNames = map[string]bool{
-	"read_file":      true,
-	"read":           true,
-	"write_file":     true,
-	"write":          true,
-	"edit_file":      true,
-	"edit":           true,
-	"bash":           true,
-	"shell":          true,
-	"grep":           true,
-	"glob":           true,
-	"webfetch":       true,
-	"webfetch_tool":  true,
-	"websearch":      true,
-	"todowrite":      true,
-	"task":           true,
-	"notebookedit":   true,
-	"tool_use":       true,
-	"function_call":  true,
-	"invoke":         true,
-	"tool":           true,
-	"function":       true,
+	"read_file":     true,
+	"read":          true,
+	"write_file":    true,
+	"write":         true,
+	"edit_file":     true,
+	"edit":          true,
+	"bash":          true,
+	"shell":         true,
+	"grep":          true,
+	"glob":          true,
+	"webfetch":      true,
+	"webfetch_tool": true,
+	"websearch":     true,
+	"todowrite":     true,
+	"task":          true,
+	"notebookedit":  true,
+	"tool_use":      true,
+	"function_call": true,
+	"invoke":        true,
+	"tool":          true,
+	"function":      true,
 }
 
 // extractXMLToolCalls parses the given content for fully-closed XML blocks
@@ -136,23 +130,7 @@ var knownXMLToolNames = map[string]bool{
 // The arguments field of the tool call is the inner XML text (preserved
 // verbatim) so downstream consumers can inspect it.
 func extractXMLToolCalls(content string) []model.Tool {
-	var toolCalls []model.Tool
-	matches := xmlToolCallPattern.FindAllStringSubmatch(content, -1)
-	for _, m := range matches {
-		tag := m[1]
-		inner := strings.TrimSpace(m[2])
-		if !knownXMLToolNames[tag] && !looksLikeToolCall(tag, inner) {
-			continue
-		}
-		toolCalls = append(toolCalls, model.Tool{
-			Id:   fmt.Sprintf("call_%s", random.GetUUID()),
-			Type: "function",
-			Function: model.Function{
-				Name:      tag,
-				Arguments: inner,
-			},
-		})
-	}
+	_, toolCalls := extractCompleteBuffer(content)
 	return toolCalls
 }
 
@@ -211,7 +189,8 @@ func responseXunfei2OpenAI(response *ChatResponse) *openai.TextResponse {
 // stripXMLToolCalls removes all fully-closed XML tool blocks from the
 // content, leaving only the prose that surrounds them.
 func stripXMLToolCalls(content string) string {
-	return strings.TrimSpace(xmlToolCallPattern.ReplaceAllString(content, ""))
+	visible, _ := extractCompleteBuffer(content)
+	return strings.TrimSpace(visible)
 }
 
 func streamResponseXunfei2OpenAI(xunfeiResponse *ChatResponse, buf *streamXMLBuffer) *openai.ChatCompletionsStreamResponse {
@@ -341,66 +320,66 @@ func (b *streamXMLBuffer) consume(chunk string) (visibleText string, toolCalls [
 // returns the prose in between, the parsed tool calls, and any trailing
 // incomplete tail that should be carried into the next chunk.
 func extractFromBuffer(buf string) (string, []model.Tool, string) {
+	return extractFromBufferImpl(buf, true)
+}
+
+// extractCompleteBuffer is like extractFromBuffer but treats any
+// unmatched opening tag as prose (since there is no "next chunk" to
+// carry it forward into). Use for non-streaming responses where the
+// full content is already accumulated.
+func extractCompleteBuffer(buf string) (string, []model.Tool) {
+	visible, toolCalls, _ := extractFromBufferImpl(buf, false)
+	return visible, toolCalls
+}
+
+func extractFromBufferImpl(buf string, holdTail bool) (string, []model.Tool, string) {
 	var (
 		visible   strings.Builder
 		toolCalls []model.Tool
 		i         = 0
 	)
 	for i < len(buf) {
-		// Skip past any closing tag or text outside an open tool call.
-		// Strategy: find the next "<tag>" opening; everything before is
-		// visible. Then look for the matching "</tag>". If we find it,
-		// extract the block as a tool call; otherwise, hold the tail.
 		openIdx := strings.Index(buf[i:], "<")
 		if openIdx == -1 {
 			visible.WriteString(buf[i:])
 			i = len(buf)
 			break
 		}
-		// Look ahead to see if this is a tag start (alpha char) or a
-		// closing tag or just "<" in prose.
 		absOpen := i + openIdx
-		// Flush prose before the angle bracket.
 		visible.WriteString(buf[i:absOpen])
-		// Try to read a tag name.
 		rest := buf[absOpen:]
 		if !isXMLTagStart(rest) {
-			// Not a tag, treat the '<' as prose and move on.
 			visible.WriteByte('<')
 			i = absOpen + 1
 			continue
 		}
-		// Read opening tag name.
 		tagName, tagEnd, ok := readXMLTagName(rest)
 		if !ok {
 			visible.WriteString(rest)
 			i = len(buf)
 			break
 		}
-		// Is it a closing tag?
 		if strings.HasPrefix(rest, "</") {
-			// Closing tag without matching opener in this buffer's tail:
-			// treat as prose (we never re-emit unmatched closing tags).
 			visible.WriteString(rest[:tagEnd])
 			i = absOpen + tagEnd
 			continue
 		}
-		// Self-closing or attributes: we only support <tag>simple</tag>.
 		if tagEnd >= len(rest) || rest[tagEnd] != '>' {
-			// Has attributes, is malformed, or hits end of buffer; treat
-			// the rest as prose.
 			visible.WriteString(rest)
 			i = len(buf)
 			break
 		}
-		// Find the matching closing tag.
 		closing := "</" + tagName + ">"
 		searchFrom := absOpen + tagEnd + 1
 		closeIdx := strings.Index(buf[searchFrom:], closing)
 		if closeIdx == -1 {
-			// Incomplete block; hold the tail (from the opening tag) for
-			// the next chunk and stop processing.
-			return visible.String(), toolCalls, buf[absOpen:]
+			if holdTail {
+				return visible.String(), toolCalls, buf[absOpen:]
+			}
+			// Complete-buffer mode: keep the unmatched opening tag in
+			// the visible text so nothing is lost.
+			visible.WriteString(buf[absOpen:])
+			return visible.String(), toolCalls, ""
 		}
 		innerStart := searchFrom
 		innerEnd := innerStart + closeIdx
@@ -415,7 +394,6 @@ func extractFromBuffer(buf string) (string, []model.Tool, string) {
 				},
 			})
 		} else {
-			// Not a tool call: keep the block in visible text.
 			visible.WriteString(buf[absOpen : innerEnd+len(closing)])
 		}
 		i = innerEnd + len(closing)
