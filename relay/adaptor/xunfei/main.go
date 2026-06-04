@@ -234,10 +234,9 @@ func streamResponseXunfei2OpenAI(xunfeiResponse *ChatResponse, buf *streamXMLBuf
 	if xunfeiResponse.Payload.Choices.Status == 2 {
 		finishReason := constant.StopFinishReason
 		if len(choice.Delta.ToolCalls) > 0 {
-			toolFinish := "tool_calls"
-			finishReason = &toolFinish
+			finishReason = "tool_calls"
 		}
-		choice.FinishReason = finishReason
+		choice.FinishReason = &finishReason
 	}
 	response := openai.ChatCompletionsStreamResponse{
 		Id:      fmt.Sprintf("chatcmpl-%s", random.GetUUID()),
