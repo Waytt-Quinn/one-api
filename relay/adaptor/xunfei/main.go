@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -85,16 +86,89 @@ func getToolCalls(response *ChatResponse) []model.Tool {
 		return toolCalls
 	}
 	item := response.Payload.Choices.Text[0]
-	if item.FunctionCall == nil {
+	if item.FunctionCall != nil {
+		toolCall := model.Tool{
+			Id:       fmt.Sprintf("call_%s", random.GetUUID()),
+			Type:     "function",
+			Function: *item.FunctionCall,
+		}
+		toolCalls = append(toolCalls, toolCall)
 		return toolCalls
 	}
-	toolCall := model.Tool{
-		Id:       fmt.Sprintf("call_%s", random.GetUUID()),
-		Type:     "function",
-		Function: *item.FunctionCall,
+	return extractXMLToolCalls(item.Content)
+}
+
+// xmlToolCallPattern matches a fully-closed XML block emitted as a tool
+// invocation by models that prefer XML over the structured function_call
+// field, e.g. "<read_file>...</read_file>".
+var xmlToolCallPattern = regexp.MustCompile(`(?s)<([A-Za-z][A-Za-z0-9_-]*)>\s*(.*?)\s*</\1>`)
+
+// knownXMLToolNames are tag names we recognise as tool invocations. The
+// model may emit tool tags it invented (e.g. <bash>); we accept any tag
+// matching the regex above and emit a function_call whose name is the
+// tag itself.
+var knownXMLToolNames = map[string]bool{
+	"read_file":      true,
+	"read":           true,
+	"write_file":     true,
+	"write":          true,
+	"edit_file":      true,
+	"edit":           true,
+	"bash":           true,
+	"shell":          true,
+	"grep":           true,
+	"glob":           true,
+	"webfetch":       true,
+	"webfetch_tool":  true,
+	"websearch":      true,
+	"todowrite":      true,
+	"task":           true,
+	"notebookedit":   true,
+	"tool_use":       true,
+	"function_call":  true,
+	"invoke":         true,
+	"tool":           true,
+	"function":       true,
+}
+
+// extractXMLToolCalls parses the given content for fully-closed XML blocks
+// that look like a tool invocation, and returns them as model.Tool slices.
+// The arguments field of the tool call is the inner XML text (preserved
+// verbatim) so downstream consumers can inspect it.
+func extractXMLToolCalls(content string) []model.Tool {
+	var toolCalls []model.Tool
+	matches := xmlToolCallPattern.FindAllStringSubmatch(content, -1)
+	for _, m := range matches {
+		tag := m[1]
+		inner := strings.TrimSpace(m[2])
+		if !knownXMLToolNames[tag] && !looksLikeToolCall(tag, inner) {
+			continue
+		}
+		toolCalls = append(toolCalls, model.Tool{
+			Id:   fmt.Sprintf("call_%s", random.GetUUID()),
+			Type: "function",
+			Function: model.Function{
+				Name:      tag,
+				Arguments: inner,
+			},
+		})
 	}
-	toolCalls = append(toolCalls, toolCall)
 	return toolCalls
+}
+
+// looksLikeToolCall applies a heuristic for tags we did not pre-register:
+// if the inner content has key=value pairs or looks like JSON, accept it
+// as a tool invocation. This catches model-invented tool names without
+// being too eager to misclassify prose.
+func looksLikeToolCall(tag, inner string) bool {
+	innerLower := strings.ToLower(inner)
+	if strings.HasPrefix(innerLower, "{") && strings.HasSuffix(innerLower, "}") {
+		return true
+	}
+	if strings.Contains(inner, "=") && strings.Contains(inner, "\n") {
+		return true
+	}
+	return false
 }
 
 func responseXunfei2OpenAI(response *ChatResponse) *openai.TextResponse {
@@ -105,14 +179,24 @@ func responseXunfei2OpenAI(response *ChatResponse) *openai.TextResponse {
 			},
 		}
 	}
+	toolCalls := getToolCalls(response)
+	content := response.Payload.Choices.Text[0].Content
+	if len(toolCalls) > 0 {
+		content = stripXMLToolCalls(content)
+	}
+	finishReason := constant.StopFinishReason
+	if len(toolCalls) > 0 {
+		toolFinish := "tool_calls"
+		finishReason = toolFinish
+	}
 	choice := openai.TextResponseChoice{
 		Index: 0,
 		Message: model.Message{
 			Role:      "assistant",
-			Content:   response.Payload.Choices.Text[0].Content,
-			ToolCalls: getToolCalls(response),
+			Content:   content,
+			ToolCalls: toolCalls,
 		},
-		FinishReason: constant.StopFinishReason,
+		FinishReason: finishReason,
 	}
 	fullTextResponse := openai.TextResponse{
 		Id:      fmt.Sprintf("chatcmpl-%s", random.GetUUID()),
@@ -124,7 +208,13 @@ func responseXunfei2OpenAI(response *ChatResponse) *openai.TextResponse {
 	return &fullTextResponse
 }
 
-func streamResponseXunfei2OpenAI(xunfeiResponse *ChatResponse) *openai.ChatCompletionsStreamResponse {
+// stripXMLToolCalls removes all fully-closed XML tool blocks from the
+// content, leaving only the prose that surrounds them.
+func stripXMLToolCalls(content string) string {
+	return strings.TrimSpace(xmlToolCallPattern.ReplaceAllString(content, ""))
+}
+
+func streamResponseXunfei2OpenAI(xunfeiResponse *ChatResponse, buf *streamXMLBuffer) *openai.ChatCompletionsStreamResponse {
 	if len(xunfeiResponse.Payload.Choices.Text) == 0 {
 		xunfeiResponse.Payload.Choices.Text = []ChatResponseTextItem{
 			{
@@ -133,8 +223,14 @@ func streamResponseXunfei2OpenAI(xunfeiResponse *ChatResponse) *openai.ChatCompl
 		}
 	}
 	var choice openai.ChatCompletionsStreamResponseChoice
-	choice.Delta.Content = xunfeiResponse.Payload.Choices.Text[0].Content
-	choice.Delta.ToolCalls = getToolCalls(xunfeiResponse)
+	rawContent := xunfeiResponse.Payload.Choices.Text[0].Content
+	visibleText, xmlToolCalls := buf.consume(rawContent)
+	choice.Delta.Content = visibleText
+	structToolCalls := getToolCalls(xunfeiResponse)
+	allToolCalls := append(structToolCalls, xmlToolCalls...)
+	if len(allToolCalls) > 0 {
+		choice.Delta.ToolCalls = allToolCalls
+	}
 	if xunfeiResponse.Payload.Choices.Status == 2 {
 		finishReason := constant.StopFinishReason
 		if len(choice.Delta.ToolCalls) > 0 {
@@ -187,13 +283,14 @@ func StreamHandler(c *gin.Context, meta *meta.Meta, textRequest model.GeneralOpe
 	}
 	common.SetEventStreamHeaders(c)
 	var usage model.Usage
+	streamBuf := newStreamXMLBuffer()
 	c.Stream(func(w io.Writer) bool {
 		select {
 		case xunfeiResponse := <-dataChan:
 			usage.PromptTokens += xunfeiResponse.Payload.Usage.Text.PromptTokens
 			usage.CompletionTokens += xunfeiResponse.Payload.Usage.Text.CompletionTokens
 			usage.TotalTokens += xunfeiResponse.Payload.Usage.Text.TotalTokens
-			response := streamResponseXunfei2OpenAI(&xunfeiResponse)
+			response := streamResponseXunfei2OpenAI(&xunfeiResponse, streamBuf)
 			jsonResponse, err := json.Marshal(response)
 			if err != nil {
 				logger.SysError("error marshalling stream response: " + err.Error())
@@ -207,6 +304,153 @@ func StreamHandler(c *gin.Context, meta *meta.Meta, textRequest model.GeneralOpe
 		}
 	})
 	return nil, &usage
+}
+
+// streamXMLBuffer tracks the partial state of XML tool-call tags across
+// streaming frames so we know when a fully-closed block has been emitted
+// and can convert it to a function_call.
+type streamXMLBuffer struct {
+	accumulated string
+}
+
+func newStreamXMLBuffer() *streamXMLBuffer {
+	return &streamXMLBuffer{}
+}
+
+// consume appends the new chunk and returns:
+//   - visibleText: the part of the chunk that is NOT inside a tool-call
+//     block, safe to send to the client as content.
+//   - toolCalls: tool calls that completed inside this chunk.
+//
+// XML tag state is tracked by counting the most recent unmatched opening
+// tag; once a closing tag of the same name arrives, the block is treated
+// as a complete tool call and removed from visibleText.
+func (b *streamXMLBuffer) consume(chunk string) (visibleText string, toolCalls []model.Tool) {
+	if chunk == "" {
+		return "", nil
+	}
+	b.accumulated += chunk
+
+	// Try to find complete <tag>...</tag> blocks anywhere in the buffer.
+	// Use a simple state machine: walk through the buffer, track depth of
+	// the most recent opening tag, and extract pairs that close properly.
+	visibleText, toolCalls, b.accumulated = extractFromBuffer(b.accumulated)
+	return visibleText, toolCalls
+}
+
+// extractFromBuffer extracts complete XML tool-call blocks from buf and
+// returns the prose in between, the parsed tool calls, and any trailing
+// incomplete tail that should be carried into the next chunk.
+func extractFromBuffer(buf string) (string, []model.Tool, string) {
+	var (
+		visible   strings.Builder
+		toolCalls []model.Tool
+		i         = 0
+	)
+	for i < len(buf) {
+		// Skip past any closing tag or text outside an open tool call.
+		// Strategy: find the next "<tag>" opening; everything before is
+		// visible. Then look for the matching "</tag>". If we find it,
+		// extract the block as a tool call; otherwise, hold the tail.
+		openIdx := strings.Index(buf[i:], "<")
+		if openIdx == -1 {
+			visible.WriteString(buf[i:])
+			i = len(buf)
+			break
+		}
+		// Look ahead to see if this is a tag start (alpha char) or a
+		// closing tag or just "<" in prose.
+		absOpen := i + openIdx
+		// Flush prose before the angle bracket.
+		visible.WriteString(buf[i:absOpen])
+		// Try to read a tag name.
+		rest := buf[absOpen:]
+		if !isXMLTagStart(rest) {
+			// Not a tag, treat the '<' as prose and move on.
+			visible.WriteByte('<')
+			i = absOpen + 1
+			continue
+		}
+		// Read opening tag name.
+		tagName, tagEnd, ok := readXMLTagName(rest)
+		if !ok {
+			visible.WriteString(rest)
+			i = len(buf)
+			break
+		}
+		// Is it a closing tag?
+		if strings.HasPrefix(rest, "</") {
+			// Closing tag without matching opener in this buffer's tail:
+			// treat as prose (we never re-emit unmatched closing tags).
+			visible.WriteString(rest[:tagEnd])
+			i = absOpen + tagEnd
+			continue
+		}
+		// Self-closing or attributes: we only support <tag>simple</tag>.
+		if tagEnd >= len(rest) || rest[tagEnd] != '>' {
+			// Has attributes, is malformed, or hits end of buffer; treat
+			// the rest as prose.
+			visible.WriteString(rest)
+			i = len(buf)
+			break
+		}
+		// Find the matching closing tag.
+		closing := "</" + tagName + ">"
+		searchFrom := absOpen + tagEnd + 1
+		closeIdx := strings.Index(buf[searchFrom:], closing)
+		if closeIdx == -1 {
+			// Incomplete block; hold the tail (from the opening tag) for
+			// the next chunk and stop processing.
+			return visible.String(), toolCalls, buf[absOpen:]
+		}
+		innerStart := searchFrom
+		innerEnd := innerStart + closeIdx
+		inner := strings.TrimSpace(buf[innerStart:innerEnd])
+		if knownXMLToolNames[tagName] || looksLikeToolCall(tagName, inner) {
+			toolCalls = append(toolCalls, model.Tool{
+				Id:   fmt.Sprintf("call_%s", random.GetUUID()),
+				Type: "function",
+				Function: model.Function{
+					Name:      tagName,
+					Arguments: inner,
+				},
+			})
+		} else {
+			// Not a tool call: keep the block in visible text.
+			visible.WriteString(buf[absOpen : innerEnd+len(closing)])
+		}
+		i = innerEnd + len(closing)
+	}
+	return visible.String(), toolCalls, ""
+}
+
+func isXMLTagStart(s string) bool {
+	if len(s) < 2 || s[0] != '<' {
+		return false
+	}
+	c := s[1]
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '/'
+}
+
+func readXMLTagName(s string) (name string, end int, ok bool) {
+	// s starts with "<" or "</"
+	i := 1
+	if i < len(s) && s[i] == '/' {
+		i++
+	}
+	start := i
+	for i < len(s) {
+		c := s[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' {
+			i++
+			continue
+		}
+		break
+	}
+	if i == start {
+		return "", 0, false
+	}
+	return s[start:i], i, true
 }
 
 func Handler(c *gin.Context, meta *meta.Meta, textRequest model.GeneralOpenAIRequest, appId string, apiSecret string, apiKey string) (*model.ErrorWithStatusCode, *model.Usage) {
