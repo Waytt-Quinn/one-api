@@ -123,13 +123,167 @@ var knownXMLToolNames = map[string]bool{
 	"function":      true,
 }
 
-// extractXMLToolCalls parses the given content for fully-closed XML blocks
-// that look like a tool invocation, and returns them as model.Tool slices.
-// The arguments field of the tool call is the inner XML text (preserved
-// verbatim) so downstream consumers can inspect it.
+// dsmlMarkers are the literal tokens that bracket DSML tool-call blocks
+// emitted by DeepSeek models: <｜DSML｜invoke name="X"> ... </｜DSML｜invoke>.
+// The "｜" character is U+FF5C (fullwidth vertical bar).
+const (
+	dsmlOpenPrefix  = "<｜DSML｜"
+	dsmlClosePrefix = "</｜DSML｜"
+)
+
+// extractXMLToolCalls parses the given content for fully-closed XML/DSML
+// blocks that look like a tool invocation, and returns them as
+// model.Tool slices. DSML blocks are emitted by DeepSeek models and look
+// like <｜DSML｜invoke name="X"> ... <｜DSML｜parameter name="k">v</｜DSML｜parameter> ... </｜DSML｜invoke>;
+// they are checked first because DeepSeek models reliably wrap tool
+// invocations in DSML. Plain <tag>...</tag> blocks from other models are
+// still picked up as a fallback.
 func extractXMLToolCalls(content string) []model.Tool {
+	if toolCalls := extractDSMLToolCalls(content); len(toolCalls) > 0 {
+		return toolCalls
+	}
 	_, toolCalls := extractCompleteBuffer(content)
 	return toolCalls
+}
+
+// extractDSMLToolCalls scans content for one or more fully-closed
+// <｜DSML｜invoke name="X"> ... </｜DSML｜invoke> blocks and converts
+// each into a model.Tool. The arguments field is a JSON object built
+// from the inner <｜DSML｜parameter name="k">value</｜DSML｜parameter>
+// children; values are kept as strings since DSML doesn't carry types.
+func extractDSMLToolCalls(content string) []model.Tool {
+	var toolCalls []model.Tool
+	for {
+		openIdx := strings.Index(content, dsmlOpenPrefix+"invoke ")
+		if openIdx < 0 {
+			break
+		}
+		gt := strings.Index(content[openIdx:], ">")
+		if gt < 0 {
+			break
+		}
+		openTag := content[openIdx : openIdx+gt+1]
+		toolName := extractDSMLAttr(openTag, "name")
+		innerStart := openIdx + gt + 1
+		closing := dsmlClosePrefix + "invoke>"
+		closeIdx := strings.Index(content[innerStart:], closing)
+		if closeIdx < 0 {
+			break
+		}
+		inner := content[innerStart : innerStart+closeIdx]
+		args := extractDSMLParameters(inner)
+		toolCalls = append(toolCalls, model.Tool{
+			Id:   fmt.Sprintf("call_%s", random.GetUUID()),
+			Type: "function",
+			Function: model.Function{
+				Name:      toolName,
+				Arguments: args,
+			},
+		})
+		content = content[innerStart+closeIdx+len(closing):]
+	}
+	return toolCalls
+}
+
+// extractDSMLAttr returns the value of the named attribute in an opening
+// DSML tag, e.g. extractDSMLAttr(`<｜DSML｜invoke name="Read">`, "name")
+// returns "Read". Returns "" when the attribute is missing.
+func extractDSMLAttr(tag, attr string) string {
+	needle := attr + "=\""
+	idx := strings.Index(tag, needle)
+	if idx < 0 {
+		return ""
+	}
+	start := idx + len(needle)
+	end := strings.Index(tag[start:], "\"")
+	if end < 0 {
+		return ""
+	}
+	return tag[start : start+end]
+}
+
+// extractDSMLParameters walks the inner text of a <｜DSML｜invoke> block
+// and returns a map of parameter name to its string value.
+func extractDSMLParameters(inner string) map[string]string {
+	args := map[string]string{}
+	for {
+		openIdx := strings.Index(inner, dsmlOpenPrefix+"parameter ")
+		if openIdx < 0 {
+			break
+		}
+		gt := strings.Index(inner[openIdx:], ">")
+		if gt < 0 {
+			break
+		}
+		openTag := inner[openIdx : openIdx+gt+1]
+		name := extractDSMLAttr(openTag, "name")
+		innerStart := openIdx + gt + 1
+		closing := dsmlClosePrefix + "parameter>"
+		closeIdx := strings.Index(inner[innerStart:], closing)
+		if closeIdx < 0 {
+			break
+		}
+		value := inner[innerStart : innerStart+closeIdx]
+		args[name] = strings.TrimSpace(value)
+		inner = inner[innerStart+closeIdx+len(closing):]
+	}
+	return args
+}
+
+// extractDSMLFromBuffer walks buf, peels out fully-closed DSML
+// <｜DSML｜invoke ...>...</｜DSML｜invoke> blocks as tool calls, and
+// returns the prose in between. When holdTail is true an unclosed
+// opening tag at the end of the buffer is preserved as the tail so the
+// streaming layer can carry it forward into the next chunk.
+func extractDSMLFromBuffer(buf string, holdTail bool) (string, []model.Tool, string) {
+	var (
+		visible   strings.Builder
+		toolCalls []model.Tool
+		i         = 0
+	)
+	for i < len(buf) {
+		openIdx := strings.Index(buf[i:], dsmlOpenPrefix+"invoke ")
+		if openIdx == -1 {
+			visible.WriteString(buf[i:])
+			i = len(buf)
+			break
+		}
+		absOpen := i + openIdx
+		visible.WriteString(buf[i:absOpen])
+		gt := strings.Index(buf[absOpen:], ">")
+		if gt < 0 {
+			// No closing > yet; hold the tail.
+			if holdTail {
+				return visible.String(), toolCalls, buf[absOpen:]
+			}
+			visible.WriteString(buf[absOpen:])
+			return visible.String(), toolCalls, ""
+		}
+		openTag := buf[absOpen : absOpen+gt+1]
+		toolName := extractDSMLAttr(openTag, "name")
+		innerStart := absOpen + gt + 1
+		closing := dsmlClosePrefix + "invoke>"
+		closeIdx := strings.Index(buf[innerStart:], closing)
+		if closeIdx < 0 {
+			if holdTail {
+				return visible.String(), toolCalls, buf[absOpen:]
+			}
+			visible.WriteString(buf[absOpen:])
+			return visible.String(), toolCalls, ""
+		}
+		inner := buf[innerStart : innerStart+closeIdx]
+		args := extractDSMLParameters(inner)
+		toolCalls = append(toolCalls, model.Tool{
+			Id:   fmt.Sprintf("call_%s", random.GetUUID()),
+			Type: "function",
+			Function: model.Function{
+				Name:      toolName,
+				Arguments: args,
+			},
+		})
+		i = innerStart + closeIdx + len(closing)
+	}
+	return visible.String(), toolCalls, ""
 }
 
 // looksLikeToolCall applies a heuristic for tags we did not pre-register:
@@ -331,6 +485,26 @@ func extractCompleteBuffer(buf string) (string, []model.Tool) {
 }
 
 func extractFromBufferImpl(buf string, holdTail bool) (string, []model.Tool, string) {
+	// DSML blocks (DeepSeek tool calls) take priority: they start with
+	// "<｜DSML｜" (a fullwidth vertical bar), not "<letter>", so the
+	// generic <tag> extractor below would misclassify them. Walk through
+	// the buffer, peel out fully-closed <｜DSML｜invoke> blocks, and feed
+	// the leftover prose through the regular extractor.
+	if strings.Contains(buf, dsmlOpenPrefix+"invoke ") {
+		dsmlVisible, dsmlToolCalls, dsmlTail := extractDSMLFromBuffer(buf, holdTail)
+		if len(dsmlToolCalls) > 0 {
+			// Run the generic extractor on the leftover prose to catch
+			// any plain <tag> blocks the model may also have emitted.
+			extraVisible, extraCalls, extraTail := extractFromBufferImplInner(dsmlVisible, holdTail)
+			return extraVisible, append(dsmlToolCalls, extraCalls...), dsmlTail + extraTail
+		}
+	}
+	return extractFromBufferImplInner(buf, holdTail)
+}
+
+// extractFromBufferImplInner is the original state-machine extractor,
+// factored out so the DSML path can chain into it on the leftover prose.
+func extractFromBufferImplInner(buf string, holdTail bool) (string, []model.Tool, string) {
 	var (
 		visible   strings.Builder
 		toolCalls []model.Tool
