@@ -10,10 +10,6 @@ type Message struct {
 	ContentType string `json:"content_type,omitempty"`
 }
 
-type Functions struct {
-	Text []model.Function `json:"text,omitempty"`
-}
-
 type ChatRequest struct {
 	Header struct {
 		AppId   string `json:"app_id,omitempty"`
@@ -35,7 +31,11 @@ type ChatRequest struct {
 		Message   struct {
 			Text []Message `json:"text"`
 		} `json:"message"`
-		Functions *Functions `json:"functions,omitempty"`
+		// Tools is the OpenAI-compatible tool schema: a list of
+		// {type:"function", function:{...}} entries. Some private
+		// gateways (e.g. one proxying DeepSeek-V3) expect this shape
+		// rather than the legacy xunfei functions.text.
+		Tools []model.Tool `json:"tools,omitempty"`
 	} `json:"payload"`
 }
 

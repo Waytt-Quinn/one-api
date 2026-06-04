@@ -67,13 +67,11 @@ func requestOpenAI2Xunfei(request model.GeneralOpenAIRequest, xunfeiAppId string
 	xunfeiRequest.Payload.Message.Text = messages
 
 	if len(request.Tools) > 0 && (config.XunfeiDomain != "" || strings.HasPrefix(xunfeiRequest.Parameter.Chat.Domain, "generalv3") || xunfeiRequest.Parameter.Chat.Domain == "4.0Ultra") {
-		functions := make([]model.Function, len(request.Tools))
+		tools := make([]model.Tool, len(request.Tools))
 		for i, tool := range request.Tools {
-			functions[i] = tool.Function
+			tools[i] = tool
 		}
-		xunfeiRequest.Payload.Functions = &Functions{
-			Text: functions,
-		}
+		xunfeiRequest.Payload.Tools = tools
 	}
 
 	return &xunfeiRequest
