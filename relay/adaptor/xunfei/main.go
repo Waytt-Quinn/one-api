@@ -33,7 +33,23 @@ import (
 // https://www.xfyun.cn/doc/spark/Web.html
 
 func requestOpenAI2Xunfei(request model.GeneralOpenAIRequest, xunfeiAppId string, domain string) *ChatRequest {
-	messages := make([]Message, 0, len(request.Messages))
+	messages := make([]Message, 0, len(request.Messages)+1)
+	if len(request.Tools) > 0 {
+		// Inject a system instruction that explicitly tells the
+		// model to emit tool calls as OpenAI-style function-call
+		// JSON (or, failing that, as the model.Tool schema we
+		// passed via Payload.Tools). The DeepSeek-V3 model behind
+		// the internal gateway otherwise invents its own XML/DSML
+		// shapes (<read_file>...</read_file>,
+		// <｜DSML｜invoke ...>...</｜DSML｜invoke>,
+		// <tools><param name="X">...</param></tools>) that the
+		// downstream client cannot execute.
+		messages = append(messages, Message{
+			Role:        "system",
+			Content:     "When you need to call a tool, respond with a JSON function_call object (OpenAI tool_calls format) whose name matches one of the function names in the supplied tool schema. Do NOT wrap the call in XML tags (no <read_file>, <tools>, or DSML markers). If a tool call is required, output the function_call object directly with no surrounding prose.",
+			ContentType: "text",
+		})
+	}
 	for _, message := range request.Messages {
 		messages = append(messages, Message{
 			Role:        message.Role,
@@ -359,6 +375,12 @@ func streamResponseXunfei2OpenAI(xunfeiResponse *ChatResponse, buf *streamXMLBuf
 	choice.Delta.Content = visibleText
 	structToolCalls := getToolCalls(xunfeiResponse)
 	allToolCalls := append(structToolCalls, xmlToolCalls...)
+	// On end-of-stream, drain any tool calls the buffer was holding
+	// in its tail (e.g. a tool block whose closing tag was cut off
+	// when the upstream stopped sending).
+	if xunfeiResponse.Payload.Choices.Status == 2 {
+		allToolCalls = append(allToolCalls, buf.flush()...)
+	}
 	if len(allToolCalls) > 0 {
 		choice.Delta.ToolCalls = allToolCalls
 	}
@@ -445,6 +467,20 @@ type streamXMLBuffer struct {
 
 func newStreamXMLBuffer() *streamXMLBuffer {
 	return &streamXMLBuffer{}
+}
+
+// flush is called when the upstream signals end-of-stream. It runs
+// the extractor on the held tail in complete-buffer mode (no
+// further chunks are coming) and returns any tool calls the buffer
+// was holding. The visible text is discarded because the client has
+// already seen everything up to the last frame.
+func (b *streamXMLBuffer) flush() []model.Tool {
+	if b.accumulated == "" {
+		return nil
+	}
+	_, toolCalls, _ := extractFromBufferImpl(b.accumulated, false)
+	b.accumulated = ""
+	return toolCalls
 }
 
 // consume appends the new chunk and returns:
