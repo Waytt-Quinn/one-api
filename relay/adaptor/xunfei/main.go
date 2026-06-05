@@ -657,9 +657,11 @@ func extractFromBufferImplInner(buf string, holdTail bool) (string, []model.Tool
 		absOpen := i + openIdx
 		visible.WriteString(buf[i:absOpen])
 		rest := buf[absOpen:]
-		// If this '<' is the start of a DSML block, hold the tail so the
-		// DSML extractor (called by the outer extractFromBufferImpl) gets
-		// a chance to consume it on a future iteration.
+		// If this '<' is the start of a DSML opening tag (e.g.
+		// <｜DSML｜invoke ...> or <｜DSML｜tool_calls>), hold the
+		// tail so the DSML extractor (called by the outer
+		// extractFromBufferImpl) gets a chance to consume it on a
+		// future iteration.
 		if strings.HasPrefix(rest, dsmlOpenPrefix) {
 			if holdTail {
 				return visible.String(), toolCalls, buf[absOpen:]
@@ -667,6 +669,27 @@ func extractFromBufferImplInner(buf string, holdTail bool) (string, []model.Tool
 			visible.WriteString(rest)
 			i = len(buf)
 			return visible.String(), toolCalls, ""
+		}
+		// If this '<' is the start of a DSML closing tag (e.g.
+		// </｜DSML｜invoke> or </｜DSML｜tool_calls>), drop the
+		// whole tag from the visible text since it's a structural
+		// marker, not content. We don't try to track in-flight
+		// DSML closes here (the in-flight open check at the top
+		// of consume handles that); this branch just cleans up
+		// the wrapper close that arrives after the inner block
+		// has been extracted.
+		if strings.HasPrefix(rest, dsmlClosePrefix) {
+			closeEnd := strings.Index(rest, ">")
+			if closeEnd < 0 {
+				if holdTail {
+					return visible.String(), toolCalls, buf[absOpen:]
+				}
+				visible.WriteString(rest)
+				i = len(buf)
+				break
+			}
+			i = absOpen + closeEnd + 1
+			continue
 		}
 		if !isXMLTagStart(rest) {
 			visible.WriteByte('<')
