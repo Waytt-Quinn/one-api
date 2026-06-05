@@ -680,11 +680,28 @@ func extractFromBufferImplInner(buf string, holdTail bool) (string, []model.Tool
 			break
 		}
 		if strings.HasPrefix(rest, "</") {
+			if tagEnd >= len(rest) || rest[tagEnd] != '>' {
+				// Partial closing tag (e.g. "</file"). Hold the
+				// tail so the next chunk can complete it.
+				if holdTail {
+					return visible.String(), toolCalls, buf[absOpen:]
+				}
+				visible.WriteString(rest)
+				i = len(buf)
+				break
+			}
 			visible.WriteString(rest[:tagEnd])
 			i = absOpen + tagEnd
 			continue
 		}
 		if tagEnd >= len(rest) || rest[tagEnd] != '>' {
+			// No closing '>' for the opening tag yet. In streaming
+			// mode hold the tail so the next chunk can complete the
+			// tag. In complete-buffer mode emit the partial tag as
+			// visible prose (nothing else is coming).
+			if holdTail {
+				return visible.String(), toolCalls, buf[absOpen:]
+			}
 			visible.WriteString(rest)
 			i = len(buf)
 			break

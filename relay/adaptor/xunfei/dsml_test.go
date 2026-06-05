@@ -61,7 +61,6 @@ func TestStreamBufferDSMLRealWSSChunks(t *testing.T) {
 		if len(tools) > 0 {
 			fmt.Printf("Frame %2d: TOOLS=%+v\n", i, tools)
 		}
-		fmt.Printf("Frame %2d: buf=%q\n", i, buf.accumulated)
 	}
 	fmt.Println("---")
 	fmt.Println("Final visible:", totalVisible.String())
