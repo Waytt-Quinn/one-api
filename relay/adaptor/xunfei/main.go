@@ -459,13 +459,150 @@ func (b *streamXMLBuffer) consume(chunk string) (visibleText string, toolCalls [
 	if chunk == "" {
 		return "", nil
 	}
+
+	// Look ahead: if this chunk's end is part of a DSML marker, hold
+	// the tail so the next chunk can complete it. Specifically: walk
+	// backwards from the end of `chunk` looking for the start of a
+	// potential "<｜DSML｜" sequence. If we find a partial DSML marker
+	// (e.g. just "<" or "<｜DSML｜t"), split the chunk and keep the
+	// tail for the next call.
+	if splitIdx := findDSMLBoundary(chunk); splitIdx >= 0 {
+		// The chunk's tail is the start of a potential DSML
+		// marker (held for next call). Everything up to splitIdx is
+		// safe prose — except that b.accumulated + chunk[:splitIdx]
+		// may have just completed a DSML opening tag (wrapper
+		// <｜DSML｜tool_calls> or opener <｜DSML｜invoke ...>). If so,
+		// move the opener to b.accumulated so it stays attached to
+		// the held tail and the DSML extractor can pair it with
+		// the matching closing tag on a later call.
+		visibleText = b.accumulated + chunk[:splitIdx]
+		b.accumulated = chunk[splitIdx:]
+		stripped, opener, ok := extractTrailingDSMLOpener(visibleText)
+		if ok {
+			visibleText = stripped
+			b.accumulated = opener + b.accumulated
+		}
+		return visibleText, nil
+	}
+
 	b.accumulated += chunk
 
-	// Try to find complete <tag>...</tag> blocks anywhere in the buffer.
-	// Use a simple state machine: walk through the buffer, track depth of
-	// the most recent opening tag, and extract pairs that close properly.
+	// After accumulation, check the buffer for an in-flight DSML
+	// block. If a <｜DSML｜ opening tag is present but the matching
+	// </｜DSML｜invoke> close hasn't been seen, hold the tail. We
+	// look for the specific </｜DSML｜invoke> close (not any
+	// </｜DSML｜...>) so that a complete block ending in
+	// </｜DSML｜invoke> gets extracted even though it contains
+	// intermediate </｜DSML｜parameter> closes.
+	dsmlOpenIdx := strings.Index(b.accumulated, dsmlOpenPrefix)
+	dsmlInvokeCloseIdx := strings.Index(b.accumulated, dsmlClosePrefix+"invoke>")
+	if dsmlOpenIdx >= 0 && (dsmlInvokeCloseIdx < 0 || dsmlInvokeCloseIdx <= dsmlOpenIdx) {
+		// Flush any prose that appeared before the DSML opening tag.
+		visibleText = b.accumulated[:dsmlOpenIdx]
+		b.accumulated = b.accumulated[dsmlOpenIdx:]
+		return visibleText, nil
+	}
+
+	// DSML block is complete (or no DSML in flight). Run the
+	// regular extractor.
 	visibleText, toolCalls, b.accumulated = extractFromBuffer(b.accumulated)
 	return visibleText, toolCalls
+}
+
+// extractTrailingDSMLOpener finds a complete DSML opening tag at the
+// end of s (ignoring trailing whitespace) and returns the visible
+// text up to (but not including) the opener, the opener itself, and
+// a found flag. Wrappers like <｜DSML｜tool_calls> are stripped from
+// visible (they are containers, not content); the opener is
+// returned so the caller can prepend it to the next-chunk held tail.
+// When no complete DSML opener is at the end, returns (s, "", false).
+func extractTrailingDSMLOpener(s string) (string, string, bool) {
+	// Find the rightmost '>' in s, ignoring trailing whitespace.
+	end := len(s)
+	for end > 0 && (s[end-1] == ' ' || s[end-1] == '\n' || s[end-1] == '\t' || s[end-1] == '\r') {
+		end--
+	}
+	if end == 0 || s[end-1] != '>' {
+		return s, "", false
+	}
+	gt := strings.LastIndex(s[:end], ">")
+	openIdx := strings.LastIndex(s[:gt], "<")
+	if openIdx < 0 {
+		return s, "", false
+	}
+	tag := s[openIdx : gt+1]
+	if !strings.HasPrefix(tag, dsmlOpenPrefix) {
+		return s, "", false
+	}
+	// Wrapper tag (e.g. <｜DSML｜tool_calls>): drop entirely, do not
+	// preserve as opener. Caller will see visible text without the
+	// wrapper and no opener attached.
+	if !strings.Contains(tag, "invoke ") {
+		return s[:openIdx], "", true
+	}
+	// Real tool opener (e.g. <｜DSML｜invoke name="Read">): keep in
+	// b.accumulated so the DSML extractor can pair it with the
+	// matching </｜DSML｜invoke> close.
+	return s[:openIdx], tag, true
+}
+
+// findDSMLBoundary returns the byte index in chunk where a partial
+// DSML marker starts (and should be held for the next chunk), or -1
+// if no such partial marker exists. The check only looks at the
+// trailing runes of chunk (up to the length of "<｜DSML｜") to avoid
+// misclassifying normal prose that happens to contain a "<" character
+// (e.g. "x < 3") as a DSML start.
+func findDSMLBoundary(chunk string) int {
+	prefixRunes := []rune(dsmlOpenPrefix)
+	maxLook := len(prefixRunes)
+	runes := []rune(chunk)
+	if len(runes) < 2 {
+		return -1
+	}
+	for offset := 1; offset <= maxLook && offset <= len(runes); offset++ {
+		if runes[len(runes)-offset] != '<' {
+			continue
+		}
+		tail := string(runes[len(runes)-offset:])
+		if couldBeDSMLStart(tail) {
+			tailRunes := []rune(tail)
+			return len(chunk) - len(string(tailRunes))
+		}
+		return -1
+	}
+	return -1
+}
+
+// couldBeDSMLStart returns true if s begins with "<" and the rest of
+// s is a prefix of "<｜DSML｜" (i.e. could be the start of a DSML
+// marker that hasn't fully arrived yet, but might be completed by
+// the next chunk). The check is rune-based because the "｜" character
+// is U+FF5C and occupies more than one byte in UTF-8. A bare "<" is
+// treated as a potential DSML start (hold) since we cannot tell until
+// the next chunk arrives.
+func couldBeDSMLStart(s string) bool {
+	if s == "" || s[0] != '<' {
+		return false
+	}
+	sRunes := []rune(s)
+	prefixRunes := []rune(dsmlOpenPrefix)
+	if len(sRunes) == 1 {
+		return true
+	}
+	if sRunes[1] != prefixRunes[1] {
+		return false
+	}
+	for i := 1; i < len(sRunes) && i < len(prefixRunes); i++ {
+		if sRunes[i] != prefixRunes[i] {
+			return false
+		}
+	}
+	for _, r := range sRunes {
+		if r == '>' {
+			return false
+		}
+	}
+	return true
 }
 
 // extractFromBuffer extracts complete XML tool-call blocks from buf and
@@ -520,6 +657,17 @@ func extractFromBufferImplInner(buf string, holdTail bool) (string, []model.Tool
 		absOpen := i + openIdx
 		visible.WriteString(buf[i:absOpen])
 		rest := buf[absOpen:]
+		// If this '<' is the start of a DSML block, hold the tail so the
+		// DSML extractor (called by the outer extractFromBufferImpl) gets
+		// a chance to consume it on a future iteration.
+		if strings.HasPrefix(rest, dsmlOpenPrefix) {
+			if holdTail {
+				return visible.String(), toolCalls, buf[absOpen:]
+			}
+			visible.WriteString(rest)
+			i = len(buf)
+			return visible.String(), toolCalls, ""
+		}
 		if !isXMLTagStart(rest) {
 			visible.WriteByte('<')
 			i = absOpen + 1
