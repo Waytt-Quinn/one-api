@@ -33,12 +33,36 @@ import (
 
 func requestOpenAI2Xunfei(request model.GeneralOpenAIRequest, xunfeiAppId string, domain string) *ChatRequest {
 	messages := make([]Message, 0, len(request.Messages))
+	hasToolResult := false
 	for _, message := range request.Messages {
 		messages = append(messages, Message{
 			Role:        message.Role,
 			Content:     message.StringContent(),
 			ContentType: "text",
 		})
+		// Track whether a tool result has already been provided in
+		// this conversation. If so, the model is being re-prompted
+		// with the tool's output and should not call the same tool
+		// again. The DeepSeek-V3 model on the internal gateway has
+		// been observed calling Read in a loop after the result was
+		// already delivered, which leaves the buffer holding a
+		// half-finished <Invoke>...</Invoke> block that never
+		// closes.
+		if message.Role == "tool" || (message.Role == "user" && strings.Contains(message.StringContent(), "Result of calling the")) {
+			hasToolResult = true
+		}
+	}
+	// When a tool result has just been delivered, append a brief
+	// tail to the last user message telling the model to consume
+	// the result and produce a final answer. The tail is a plain
+	// instruction rather than a full system prompt, which would be
+	// too disruptive (it caused the model to emit only "<tools>"
+	// and stop in earlier experiments).
+	if hasToolResult && len(messages) > 0 {
+		last := &messages[len(messages)-1]
+		if last.Role == "user" {
+			last.Content = last.Content + "\n\nThe tool result above is now available. Produce the final answer using that result; do not call any more tools."
+		}
 	}
 	xunfeiRequest := ChatRequest{}
 	xunfeiRequest.Header.AppId = xunfeiAppId
