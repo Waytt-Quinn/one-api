@@ -51,12 +51,19 @@ func requestOpenAI2Xunfei(request model.GeneralOpenAIRequest, xunfeiAppId string
 		xunfeiRequest.Parameter.Chat.Domain = domain
 	}
 	xunfeiRequest.Parameter.Chat.Temperature = request.Temperature
+	// Xunfei protocol's top_k is a sampling parameter (number of
+	// top tokens to consider). OpenAI's `n` is a different thing
+	// (how many completions to generate). The two were being
+	// conflated here, with the side effect of forcing top_k=1
+	// whenever Claude Code sent n=1 (the default) — which makes
+	// the model deterministic and causes it to get stuck emitting
+	// repeated tokens like "<tools>". Only honour top_k when it
+	// is explicitly configured via XUNFEI_TOP_K; otherwise leave
+	// the field at zero (gateway default).
 	if config.XunfeiTopK != "" {
 		if n, err := strconv.Atoi(config.XunfeiTopK); err == nil {
 			xunfeiRequest.Parameter.Chat.TopK = n
 		}
-	} else if request.N != 0 {
-		xunfeiRequest.Parameter.Chat.TopK = request.N
 	}
 	xunfeiRequest.Parameter.Chat.MaxTokens = request.MaxTokens
 	if config.XunfeiContextEnabled != "" {
