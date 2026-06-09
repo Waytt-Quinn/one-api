@@ -863,6 +863,12 @@ func xunfeiMakeRequest(textRequest model.GeneralOpenAIRequest, domain, authUrl, 
 		return nil, nil, err
 	}
 	data := requestOpenAI2Xunfei(textRequest, appId, domain)
+	// DEBUG: log the WSS payload so we can see exactly what the
+	// gateway receives. Useful for diagnosing tool-calling
+	// behaviour when the model emits unexpected XML shapes.
+	if payloadJSON, marshalErr := json.Marshal(data); marshalErr == nil {
+		logger.SysLog("xunfei wss request: " + string(payloadJSON))
+	}
 	err = conn.WriteJSON(data)
 	if err != nil {
 		return nil, nil, err
