@@ -51,12 +51,15 @@ func requestOpenAI2Xunfei(request model.GeneralOpenAIRequest, xunfeiAppId string
 		xunfeiRequest.Parameter.Chat.Domain = domain
 	}
 	xunfeiRequest.Parameter.Chat.Temperature = request.Temperature
-	// Don't set top_k. With top_k=1 the model becomes deterministic
+	// Force top_k to 0. With top_k=1 the model becomes deterministic
 	// (greedy) regardless of temperature, which causes it to get
 	// stuck emitting repeated tokens and to ignore tool schemas.
-	// Leave the field at the Go zero value (0) and let the gateway
-	// apply its default. XUNFEI_TOP_K is still honoured for users
-	// who want to override the gateway default.
+	// We explicitly assign 0 (the Go zero value) so the JSON
+	// marshal sees the field and "omitempty" drops it, leaving the
+	// gateway free to apply its own default sampling strategy.
+	// XUNFEI_TOP_K is still honoured for users who want to override
+	// the gateway default.
+	xunfeiRequest.Parameter.Chat.TopK = 0
 	if config.XunfeiTopK != "" {
 		if n, err := strconv.Atoi(config.XunfeiTopK); err == nil {
 			xunfeiRequest.Parameter.Chat.TopK = n
@@ -871,7 +874,7 @@ func xunfeiMakeRequest(textRequest model.GeneralOpenAIRequest, domain, authUrl, 
 	// gateway receives. Useful for diagnosing tool-calling
 	// behaviour when the model emits unexpected XML shapes.
 	if payloadJSON, marshalErr := json.Marshal(data); marshalErr == nil {
-		logger.SysLog("xunfei wss request: " + string(payloadJSON))
+		logger.SysLog(fmt.Sprintf("xunfei wss request [one-api %s]: %s", common.Version, string(payloadJSON)))
 	}
 	err = conn.WriteJSON(data)
 	if err != nil {
