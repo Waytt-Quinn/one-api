@@ -11,7 +11,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
@@ -51,20 +50,13 @@ func requestOpenAI2Xunfei(request model.GeneralOpenAIRequest, xunfeiAppId string
 		xunfeiRequest.Parameter.Chat.Domain = domain
 	}
 	xunfeiRequest.Parameter.Chat.Temperature = request.Temperature
-	// Force top_k to 0. With top_k=1 the model becomes deterministic
+	// Don't set top_k. With top_k=1 the model becomes deterministic
 	// (greedy) regardless of temperature, which causes it to get
 	// stuck emitting repeated tokens and to ignore tool schemas.
-	// We explicitly assign 0 (the Go zero value) so the JSON
-	// marshal sees the field and "omitempty" drops it, leaving the
-	// gateway free to apply its own default sampling strategy.
-	// XUNFEI_TOP_K is still honoured for users who want to override
-	// the gateway default.
-	xunfeiRequest.Parameter.Chat.TopK = 0
-	if config.XunfeiTopK != "" {
-		if n, err := strconv.Atoi(config.XunfeiTopK); err == nil {
-			xunfeiRequest.Parameter.Chat.TopK = n
-		}
-	}
+	// We leave the field at the Go zero value (0) and "omitempty"
+	// drops it from the JSON, so the gateway uses its default
+	// sampling strategy. The right knob for randomness is
+	// temperature, not top_k.
 	xunfeiRequest.Parameter.Chat.MaxTokens = request.MaxTokens
 	if config.XunfeiContextEnabled != "" {
 		b := strings.ToLower(config.XunfeiContextEnabled) == "true"
@@ -902,6 +894,8 @@ func xunfeiMakeRequest(textRequest model.GeneralOpenAIRequest, domain, authUrl, 
 				logger.SysError("error unmarshalling stream response: " + err.Error())
 				break
 			}
+			// DEBUG: log the raw WSS response payload.
+			logger.SysLog(fmt.Sprintf("xunfei wss response [one-api %s]: %s", common.Version, string(msg)))
 			msg = nil
 			dataChan <- response
 			if response.Payload.Choices.Status == 2 {

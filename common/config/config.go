@@ -88,10 +88,6 @@ var XunfeiInsecureSkipVerify = strings.ToLower(os.Getenv("XUNFEI_INSECURE_SKIP_V
 // that requires a custom domain string (e.g. "DeepSeek-V3").
 var XunfeiDomain = os.Getenv("XUNFEI_DOMAIN")
 
-// XunfeiTopK overrides parameter.chat.top_k. Empty keeps one-api's default
-// (which uses request.N when set, else 0).
-var XunfeiTopK = os.Getenv("XUNFEI_TOP_K")
-
 // XunfeiContextEnabled forces parameter.chat.contextEnabled. Empty leaves
 // the field unset so the upstream uses its own default. Set to "true" /
 // "false" to override explicitly.
