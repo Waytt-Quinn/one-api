@@ -427,6 +427,13 @@ func StreamHandler(c *gin.Context, meta *meta.Meta, textRequest model.GeneralOpe
 			usage.TotalTokens += xunfeiResponse.Payload.Usage.Text.TotalTokens
 			response := streamResponseXunfei2OpenAI(&xunfeiResponse, streamBuf)
 			jsonResponse, err := json.Marshal(response)
+			// DEBUG: log the OpenAI SSE chunk so we can verify the
+			// model is being converted to delta.tool_calls. The
+			// [one-api VERSION] prefix matches the request/response
+			// log format added in e7e43db / d5f5f55.
+			if err == nil {
+				logger.SysLog(fmt.Sprintf("xunfei openai chunk [one-api %s]: %s", common.Version, string(jsonResponse)))
+			}
 			if err != nil {
 				logger.SysError("error marshalling stream response: " + err.Error())
 				return true
