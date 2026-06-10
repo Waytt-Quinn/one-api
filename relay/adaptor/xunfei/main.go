@@ -32,37 +32,29 @@ import (
 // https://www.xfyun.cn/doc/spark/Web.html
 
 func requestOpenAI2Xunfei(request model.GeneralOpenAIRequest, xunfeiAppId string, domain string) *ChatRequest {
-	messages := make([]Message, 0, len(request.Messages))
-	hasToolResult := false
+	messages := make([]Message, 0, len(request.Messages)+1)
+	if len(request.Tools) > 0 {
+		// Inject the ds2api-style tool-call format instructions as
+		// the FIRST system message. ds2api's prompt is the de-facto
+		// reference for getting DeepSeek-class models to emit
+		// machine-parseable tool calls on gateways that don't do
+		// the conversion for us; the Xunfei WSS path needs it
+		// because the gateway hands back raw text. The prompt uses
+		// halfwidth pipes (|) which is also the form our parser
+		// now canonicalises to (normalizeDSMLPipe folds the
+		// fullwidth ｜ form some DeepSeek-V3 outputs use).
+		messages = append(messages, Message{
+			Role:        "system",
+			Content:     dsmlToolCallInstructions(toolNamesOf(request.Tools)),
+			ContentType: "text",
+		})
+	}
 	for _, message := range request.Messages {
 		messages = append(messages, Message{
 			Role:        message.Role,
 			Content:     message.StringContent(),
 			ContentType: "text",
 		})
-		// Track whether a tool result has already been provided in
-		// this conversation. If so, the model is being re-prompted
-		// with the tool's output and should not call the same tool
-		// again. The DeepSeek-V3 model on the internal gateway has
-		// been observed calling Read in a loop after the result was
-		// already delivered, which leaves the buffer holding a
-		// half-finished <Invoke>...</Invoke> block that never
-		// closes.
-		if message.Role == "tool" || (message.Role == "user" && strings.Contains(message.StringContent(), "Result of calling the")) {
-			hasToolResult = true
-		}
-	}
-	// When a tool result has just been delivered, append a brief
-	// tail to the last user message telling the model to consume
-	// the result and produce a final answer. The tail is a plain
-	// instruction rather than a full system prompt, which would be
-	// too disruptive (it caused the model to emit only "<tools>"
-	// and stop in earlier experiments).
-	if hasToolResult && len(messages) > 0 {
-		last := &messages[len(messages)-1]
-		if last.Role == "user" {
-			last.Content = last.Content + "\n\nThe tool result above is now available. Produce the final answer using that result; do not call any more tools."
-		}
 	}
 	xunfeiRequest := ChatRequest{}
 	xunfeiRequest.Header.AppId = xunfeiAppId
@@ -147,21 +139,34 @@ var knownXMLToolNames = map[string]bool{
 }
 
 // dsmlMarkers are the literal tokens that bracket DSML tool-call blocks
-// emitted by DeepSeek models: <｜DSML｜invoke name="X"> ... </｜DSML｜invoke>.
-// The "｜" character is U+FF5C (fullwidth vertical bar).
+// emitted by DeepSeek models: <|DSML|invoke name="X"> ... </|DSML|invoke>.
+// The "|" character is halfwidth (U+007C) in some model outputs and
+// fullwidth (U+FF5C, "｜") in others. We define the halfwidth form
+// here as the canonical prefix and pre-normalise incoming text via
+// normalizeDSMLPipe so the parser matches either form.
 const (
-	dsmlOpenPrefix  = "<｜DSML｜"
-	dsmlClosePrefix = "</｜DSML｜"
+	dsmlOpenPrefix  = "<|DSML|"
+	dsmlClosePrefix = "</|DSML|"
 )
+
+// normalizeDSMLPipe rewrites the fullwidth vertical bar (U+FF5C,
+// used by some DeepSeek-V3 outputs) to the halfwidth pipe (U+007C,
+// the form the ds2api DSML prompt instructs the model to emit and
+// the form our prompt injection below uses). This is a string-wide
+// rewrite because the pipe can appear anywhere in the markup.
+func normalizeDSMLPipe(s string) string {
+	return strings.ReplaceAll(s, "｜", "|")
+}
 
 // extractXMLToolCalls parses the given content for fully-closed XML/DSML
 // blocks that look like a tool invocation, and returns them as
 // model.Tool slices. DSML blocks are emitted by DeepSeek models and look
-// like <｜DSML｜invoke name="X"> ... <｜DSML｜parameter name="k">v</｜DSML｜parameter> ... </｜DSML｜invoke>;
+// like <|DSML|invoke name="X"> ... <|DSML|parameter name="k">v</|DSML|parameter> ... </|DSML|invoke>;
 // they are checked first because DeepSeek models reliably wrap tool
 // invocations in DSML. Plain <tag>...</tag> blocks from other models are
 // still picked up as a fallback.
 func extractXMLToolCalls(content string) []model.Tool {
+	content = normalizeDSMLPipe(content)
 	if toolCalls := extractDSMLToolCalls(content); len(toolCalls) > 0 {
 		return toolCalls
 	}
@@ -509,6 +514,9 @@ func (b *streamXMLBuffer) consume(chunk string) (visibleText string, toolCalls [
 	if chunk == "" {
 		return "", nil
 	}
+	// Normalise fullwidth pipes to halfwidth so the DSML prefix
+	// detection and the extractor can use a single set of constants.
+	chunk = normalizeDSMLPipe(chunk)
 
 	// Look ahead: if this chunk's end is part of a DSML marker, hold
 	// the tail so the next chunk can complete it. Specifically: walk
@@ -672,11 +680,13 @@ func extractCompleteBuffer(buf string) (string, []model.Tool) {
 }
 
 func extractFromBufferImpl(buf string, holdTail bool) (string, []model.Tool, string) {
+	buf = normalizeDSMLPipe(buf)
 	// DSML blocks (DeepSeek tool calls) take priority: they start with
-	// "<｜DSML｜" (a fullwidth vertical bar), not "<letter>", so the
-	// generic <tag> extractor below would misclassify them. Walk through
-	// the buffer, peel out fully-closed <｜DSML｜invoke> blocks, and feed
-	// the leftover prose through the regular extractor.
+	// "<|DSML|" — a halfwidth pipe after the prompt we inject, but
+	// some DeepSeek-V3 outputs use a fullwidth "｜" pipe. The
+	// normalizeDSMLPipe call above folds the fullwidth form to
+	// halfwidth so the rest of the parser can match either with
+	// the same string constants.
 	if strings.Contains(buf, dsmlOpenPrefix+"invoke ") {
 		dsmlVisible, dsmlToolCalls, dsmlTail := extractDSMLFromBuffer(buf, holdTail)
 		if len(dsmlToolCalls) > 0 {
@@ -941,4 +951,74 @@ func xunfeiMakeRequest(textRequest model.GeneralOpenAIRequest, domain, authUrl, 
 	}()
 
 	return dataChan, stopChan, nil
+}
+
+// toolNamesOf extracts the function name from each model.Tool, in
+// the order they were declared. Used to render concrete tool names
+// in the DSML prompt's example blocks.
+func toolNamesOf(tools []model.Tool) []string {
+	names := make([]string, 0, len(tools))
+	for _, t := range tools {
+		if t.Function.Name != "" {
+			names = append(names, t.Function.Name)
+		}
+	}
+	return names
+}
+
+// dsmlToolCallInstructions returns a system-prompt block that
+// instructs the model to emit tool calls using the DSML format that
+// ds2api (DeepSeek-to-OpenAI bridge) and our parser both understand.
+// Ported from ds2api's internal/toolcall/tool_prompt.go so the
+// Xunfei WSS path gets the same prompt that works there.
+//
+// Halfwidth pipes (|) are used; the parser normalises the fullwidth
+// form (some DeepSeek-V3 outputs) to halfwidth before matching.
+func dsmlToolCallInstructions(toolNames []string) string {
+	const header = `TOOL CALL FORMAT — FOLLOW EXACTLY:
+
+<|DSML|tool_calls>
+  <|DSML|invoke name="TOOL_NAME">
+    <|DSML|parameter name="PARAMETER_NAME">VALUE</|DSML|parameter>
+  </|DSML|invoke>
+</|DSML|tool_calls>
+
+RULES:
+1) Use the <|DSML|tool_calls> wrapper format.
+2) Put one or more <|DSML|invoke> entries under a single <|DSML|tool_calls> root.
+3) Put the tool name in the invoke name attribute: <|DSML|invoke name="TOOL_NAME">.
+4) Every top-level argument must be a <|DSML|parameter name="ARG_NAME">VALUE</|DSML|parameter> node.
+5) Use only the parameter names in the tool schema. Do not invent fields.
+6) Fill parameters with the actual values required for this call.
+7) If a required parameter value is unknown, answer normally instead of outputting an empty tool call.
+8) Do NOT wrap XML in markdown fences. Do NOT output explanations or internal monologue around the tool block.
+9) The first non-whitespace characters of the tool block must be exactly <|DSML|tool_calls>.
+10) Never omit the opening <|DSML|tool_calls> tag.
+11) Compatibility note: the runtime also accepts the legacy XML tags <tool_calls> / <invoke> / <parameter>, but prefer the DSML-prefixed form above.
+
+When you are NOT calling a tool, just answer normally with prose. Do not emit empty <|DSML|tool_calls></|DSML|tool_calls> wrappers.
+`
+	return header + dsmlExampleBlock(toolNames)
+}
+
+// dsmlExampleBlock renders a single positive example using the
+// first non-empty tool name from names. The example shows the
+// minimal correct format with one parameter.
+func dsmlExampleBlock(names []string) string {
+	for _, n := range names {
+		if n == "" {
+			continue
+		}
+		var b strings.Builder
+		b.WriteString("\nEXAMPLE:\n")
+		b.WriteString("<|DSML|tool_calls>\n")
+		b.WriteString("  <|DSML|invoke name=\"")
+		b.WriteString(n)
+		b.WriteString("\">\n")
+		b.WriteString("    <|DSML|parameter name=\"ARG_NAME\">VALUE</|DSML|parameter>\n")
+		b.WriteString("  </|DSML|invoke>\n")
+		b.WriteString("</|DSML|tool_calls>\n")
+		return b.String()
+	}
+	return ""
 }
