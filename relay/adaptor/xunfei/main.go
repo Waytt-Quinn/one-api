@@ -205,7 +205,7 @@ func extractDSMLToolCalls(content string) []model.Tool {
 			Type: "function",
 			Function: model.Function{
 				Name:      toolName,
-				Arguments: args,
+				Arguments: argumentsToJSONString(args),
 			},
 		})
 		content = content[innerStart+closeIdx+len(closing):]
@@ -231,9 +231,18 @@ func extractDSMLAttr(tag, attr string) string {
 }
 
 // extractDSMLParameters walks the inner text of a <｜DSML｜invoke> block
-// and returns a map of parameter name to its string value.
-func extractDSMLParameters(inner string) map[string]string {
-	args := map[string]string{}
+// and returns a map of parameter name to its decoded value. The
+// `string="true|false"` attribute on each <｜DSML｜parameter> tag
+// determines the value type:
+//   - string="true": the value is taken as a raw string.
+//   - string="false": the value is JSON (number, boolean, array,
+//     or object) and is decoded into its native Go type.
+//
+// This matches the behaviour of decode_dsml_to_arguments in the
+// DeepSeek-V4 reference encoder
+// (D:/workspace/DeepSeek-V4-Flash/encoding/encoding_dsv4.py).
+func extractDSMLParameters(inner string) map[string]any {
+	args := map[string]any{}
 	for {
 		openIdx := strings.Index(inner, dsmlOpenPrefix+"parameter ")
 		if openIdx < 0 {
@@ -245,17 +254,47 @@ func extractDSMLParameters(inner string) map[string]string {
 		}
 		openTag := inner[openIdx : openIdx+gt+1]
 		name := extractDSMLAttr(openTag, "name")
+		stringAttr := extractDSMLAttr(openTag, "string")
 		innerStart := openIdx + gt + 1
 		closing := dsmlClosePrefix + "parameter>"
 		closeIdx := strings.Index(inner[innerStart:], closing)
 		if closeIdx < 0 {
 			break
 		}
-		value := inner[innerStart : innerStart+closeIdx]
-		args[name] = strings.TrimSpace(value)
+		rawValue := strings.TrimSpace(inner[innerStart : innerStart+closeIdx])
+		if stringAttr == "false" {
+			var decoded any
+			if err := json.Unmarshal([]byte(rawValue), &decoded); err == nil {
+				args[name] = decoded
+			} else {
+				// Malformed JSON: fall back to the raw text so the
+				// tool still receives something usable.
+				args[name] = rawValue
+			}
+		} else {
+			// Default to string, matching the deepseek reference
+			// which wraps string values with json.dumps.
+			args[name] = rawValue
+		}
 		inner = inner[innerStart+closeIdx+len(closing):]
 	}
 	return args
+}
+
+// argumentsToJSONString serialises a parsed argument map to a JSON
+// string in the format expected by the OpenAI Chat Completions
+// spec (https://platform.openai.com/docs/api-reference/chat/object):
+// `function.arguments` is a JSON-encoded string, not an object. The
+// deepseek reference uses json.dumps(...) for the same purpose.
+func argumentsToJSONString(args map[string]any) string {
+	if len(args) == 0 {
+		return "{}"
+	}
+	b, err := json.Marshal(args)
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
 }
 
 // extractDSMLFromBuffer walks buf, peels out fully-closed DSML
@@ -311,7 +350,7 @@ func extractDSMLFromBuffer(buf string, holdTail bool) (string, []model.Tool, str
 			Type: "function",
 			Function: model.Function{
 				Name:      toolName,
-				Arguments: args,
+				Arguments: argumentsToJSONString(args),
 			},
 		})
 		i = innerStart + closeIdx + len(closing)

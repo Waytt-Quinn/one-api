@@ -80,9 +80,9 @@ func TestStreamBufferDSMLRealWSSChunks(t *testing.T) {
 	}
 	if got := totalTools[0].Function.Arguments; got == nil {
 		t.Errorf("expected non-nil arguments, got nil")
-	} else if m, ok := got.(map[string]string); !ok {
-		t.Errorf("expected map[string]string args, got %T", got)
-	} else if m["file_path"] == "" {
-		t.Errorf("expected non-empty file_path arg, got empty map: %v", m)
+	} else if argsStr, ok := got.(string); !ok {
+		t.Errorf("expected JSON-string args, got %T", got)
+	} else if !strings.Contains(argsStr, "file_path") || !strings.Contains(argsStr, "中期评审提示词") {
+		t.Errorf("expected args to contain file_path and the filename, got %q", argsStr)
 	}
 }
