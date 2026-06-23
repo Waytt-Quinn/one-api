@@ -302,6 +302,9 @@ func argumentsToJSONString(args map[string]any) string {
 // returns the prose in between. When holdTail is true an unclosed
 // opening tag at the end of the buffer is preserved as the tail so the
 // streaming layer can carry it forward into the next chunk.
+//
+// Both the leading <｜DSML｜tool_calls> wrapper and the trailing
+// </｜DSML｜tool_calls> close are stripped from the visible prose.
 func extractDSMLFromBuffer(buf string, holdTail bool) (string, []model.Tool, string) {
 	var (
 		visible   strings.Builder
@@ -311,7 +314,12 @@ func extractDSMLFromBuffer(buf string, holdTail bool) (string, []model.Tool, str
 	for i < len(buf) {
 		openIdx := strings.Index(buf[i:], dsmlOpenPrefix+"invoke ")
 		if openIdx == -1 {
-			visible.WriteString(buf[i:])
+			// No more invoke blocks. The remainder may be a
+			// closing wrapper ("</|DSML|tool_calls>" plus a
+			// trailing newline) — strip the complete portion and
+			// hold any partial prefix as the tail so the next
+			// chunk can complete the tag.
+			visible.WriteString(stripTrailingDSMLWrapper(buf[i:]))
 			i = len(buf)
 			break
 		}
@@ -355,7 +363,63 @@ func extractDSMLFromBuffer(buf string, holdTail bool) (string, []model.Tool, str
 		})
 		i = innerStart + closeIdx + len(closing)
 	}
+	// If the tail after the last invoke (i.e. buf[i:]) is a
+	// partial closing wrapper ("</|DSML|tool_calls>" arriving in
+	// pieces), hold it so the next chunk can complete the tag and
+	// the stripTrailingDSMLWrapper call above can drop it from
+	// visible prose. Without this, "</" or "</|DSML" would leak
+	// into the visible text.
+	if holdTail {
+		if _, ok := findTrailingPartialDSMLClose(buf[i:]); ok {
+			if closeStart := strings.LastIndex(buf[i:], "</"); closeStart >= 0 {
+				return visible.String(), toolCalls, buf[i+closeStart:]
+			}
+		}
+	}
 	return visible.String(), toolCalls, ""
+}
+
+// findTrailingPartialDSMLClose returns (true) when buf ends with a
+// non-empty prefix of "</|DSML|tool_calls>" (or any other
+// </|DSML|... close) that has not yet seen its closing ">". Used
+// to detect when a DSML closing wrapper is still arriving across
+// WSS frames.
+func findTrailingPartialDSMLClose(buf string) (int, bool) {
+	// The longest meaningful close we care about is the wrapper
+	// itself, "</|DSML|tool_calls>".
+	wrapper := dsmlClosePrefix + "tool_calls>"
+	// Walk back from the end, looking for a partial prefix that
+	// starts with "</". The minimum is "</" (the partial close
+	// start) and the maximum is the full wrapper.
+	max := len(wrapper)
+	if max > len(buf) {
+		max = len(buf)
+	}
+	for length := 2; length <= max; length++ {
+		tail := buf[len(buf)-length:]
+		if !strings.HasPrefix(tail, "</") {
+			break
+		}
+		if isDSMLClosePrefixOrPartial(tail) && length < len(wrapper) {
+			return length, true
+		}
+	}
+	return 0, false
+}
+
+// isDSMLClosePrefixOrPartial returns true if s is a non-empty
+// prefix of any </|DSML|... close tag, OR s is the full wrapper
+// "</|DSML|tool_calls>" (in which case it should be stripped, not
+// held). We use the wrapper specifically because the streaming
+// layer otherwise has no way to know which close tag is
+// incoming.
+func isDSMLClosePrefixOrPartial(s string) bool {
+	wrapper := dsmlClosePrefix + "tool_calls>"
+	if s == wrapper {
+		// Full wrapper; not partial.
+		return false
+	}
+	return strings.HasPrefix(wrapper, s)
 }
 
 // looksLikeToolCall applies a heuristic for tags we did not pre-register:
@@ -596,7 +660,6 @@ func (b *streamXMLBuffer) consume(chunk string) (visibleText string, toolCalls [
 	// </|DSML|invoke> close. Holding the tail here is what keeps
 	// partial DSML markers from being emitted as visible prose.
 	dsmlOpenIdx := strings.Index(b.accumulated, dsmlOpenPrefix)
-	dsmlOpenPartialIdx := strings.Index(b.accumulated, "<|DSML")
 	dsmlInvokeCloseIdx := strings.Index(b.accumulated, dsmlClosePrefix+"invoke>")
 	if dsmlOpenIdx >= 0 && (dsmlInvokeCloseIdx < 0 || dsmlInvokeCloseIdx <= dsmlOpenIdx) {
 		// Flush any prose that appeared before the DSML opening tag.
@@ -604,11 +667,17 @@ func (b *streamXMLBuffer) consume(chunk string) (visibleText string, toolCalls [
 		b.accumulated = b.accumulated[dsmlOpenIdx:]
 		return visibleText, nil
 	}
-	if dsmlOpenPartialIdx >= 0 && dsmlInvokeCloseIdx < 0 {
-		// Partial DSML prefix in flight, with no closing
-		// </|DSML|invoke> yet seen. Hold the tail.
-		visibleText = b.accumulated[:dsmlOpenPartialIdx]
-		b.accumulated = b.accumulated[dsmlOpenPartialIdx:]
+	// Partial DSML prefix in flight: the buffer ends with a
+	// non-empty prefix of "<|DSML|" but doesn't yet contain the
+	// full opener. The model can split the marker across many
+	// frames (e.g. one frame ends with "<", the next is "|" or
+	// "DS" or "ML|"), so we must hold the tail for any prefix
+	// length from 1 char up to dsmlOpenPrefix. Without this check
+	// the buffer would emit "<|" or "<|D" as visible prose and
+	// the user would see the DSML markup leaking into the chat.
+	if partialStart, ok := findTrailingPartialDSML(b.accumulated); ok && dsmlInvokeCloseIdx < 0 {
+		visibleText = b.accumulated[:partialStart]
+		b.accumulated = b.accumulated[partialStart:]
 		return visibleText, nil
 	}
 
@@ -616,6 +685,38 @@ func (b *streamXMLBuffer) consume(chunk string) (visibleText string, toolCalls [
 	// regular extractor.
 	visibleText, toolCalls, b.accumulated = extractFromBuffer(b.accumulated)
 	return visibleText, toolCalls
+}
+
+// findTrailingPartialDSML checks whether s ends with a non-empty
+// prefix of dsmlOpenPrefix ("<|DSML|"). If so, returns the byte
+// position of the start of that prefix and true. Otherwise returns
+// (0, false). The model splits the marker across many WSS frames
+// (e.g. one frame ends with "<", next is "|", next "DS", next
+// "ML|"), so the buffer must hold any partial prefix until the
+// full opener or a different `<...` tag is seen.
+func findTrailingPartialDSML(s string) (int, bool) {
+	prefix := dsmlOpenPrefix
+	// The longest possible trailing prefix is the full prefix.
+	// We look at the last len(prefix) bytes of s and see if any
+	// suffix of s matches a prefix of `prefix`.
+	max := len(prefix)
+	if max > len(s) {
+		max = len(s)
+	}
+	// Walk from longest to shortest trailing substring that
+	// could be a partial DSML prefix. We need at least 1 char
+	// (the leading "<") to match.
+	for length := max; length >= 1; length-- {
+		tail := s[len(s)-length:]
+		if isDSMLPrefixOrPartial(tail) && length < len(prefix) {
+			return len(s) - length, true
+		}
+		// Stop scanning once the first char doesn't match.
+		if !isDSMLPrefixOrPartial(tail) {
+			break
+		}
+	}
+	return 0, false
 }
 
 // extractTrailingDSMLOpener finds a complete DSML opening tag at the
@@ -823,6 +924,23 @@ func extractFromBufferImplInner(buf string, holdTail bool) (string, []model.Tool
 			}
 			i = absOpen + closeEnd + 1
 			continue
+		}
+		// Partial closing DSML wrapper ("</" or "</|DSML" or
+		// "</|DSML|tool_calls" without the closing ">"): hold
+		// the tail so the next chunk can complete it. Without
+		// this, the </|DSML|tool_calls> wrapper close arriving
+		// in pieces would leak into the visible prose.
+		if strings.HasPrefix(rest, "</") {
+			if isDSMLClosePrefixOrPartial(rest) {
+				if holdTail {
+					return visible.String(), toolCalls, buf[absOpen:]
+				}
+				// Complete-buffer mode: the partial close
+				// never got completed, so emit it as visible.
+				visible.WriteString(rest)
+				i = len(buf)
+				break
+			}
 		}
 		if !isXMLTagStart(rest) {
 			visible.WriteByte('<')
