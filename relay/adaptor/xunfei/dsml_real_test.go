@@ -47,7 +47,7 @@ func TestStreamBufferDSMLRealClaudeTokens(t *testing.T) {
 			fmt.Printf("Frame %d: TOOLS=%d\n", i, len(tools))
 		}
 		if visible != "" {
-			fmt.Printf("Frame %d: visible=%q (acc=%q)\n", i, visible, buf.accumulated)
+			fmt.Printf("Frame %d: visible=%q\n", i, visible)
 		}
 	}
 	for _, tc := range buf.flush() {

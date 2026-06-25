@@ -86,3 +86,71 @@ func TestStreamBufferDSMLRealWSSChunks(t *testing.T) {
 		t.Errorf("expected args to contain file_path and the filename, got %q", argsStr)
 	}
 }
+
+// TestStreamBufferClaudeCodeToolCall replays the exact WSS frame
+// sequence from oneapi-2026.06.23-10.49.log (seq 10-58) that
+// caused Claude Code to show raw DSML markup in the chat and
+// fail to invoke the local tool. The model emitted a Bash
+// invocation with a malformed wrapper opener
+// ("<|DSML|tool_calls|\n") and a malformed invoke opener
+// ("<|DSML|invoke name=\"Bash\""), and the parameter close
+// arrived with an extra pipe. The streaming buffer must:
+//   - Suppress the DSML wrapper so it never reaches the chat.
+//   - Parse the Bash tool call with command="ls -la".
+//   - Not leak any "<|DSML|", "DSML", "<|", or "<tool" substring
+//     into the visible content.
+func TestStreamBufferClaudeCodeToolCall(t *testing.T) {
+	chunks := []string{
+		// Prose before the tool call.
+		"好的", "，", "我来查看", "当前工作", "目录的结构", "。请", "稍", "等。\n\n",
+		// Tool call: malformed wrapper opener, then invoke + parameters.
+		"<|", "DS", "ML", "|tool", "_calls", "|\n",
+		"  <", "|DS", "ML|", "invoke", " name=\"", "Bash", "\"", "   ",
+		" <|", "DSML", "|parameter", " name=\"", "command",
+		"\"", "ls -", "la</", "|", "DSML", "|parameter",
+		">\n   ", " <|", "DSML", "|parameter", " name=\"", "description",
+		"\"", "List", " files", " in current", " directory</",
+		"|", "DSML", "|parameter", ">\n ", " </|", "DSML",
+		"|inv", "oke>\n", "</|", "DSML", "|tool", "_calls", "|", ">",
+	}
+
+	buf := newStreamXMLBuffer()
+	var totalVisible strings.Builder
+	var totalTools []model.Tool
+	for _, c := range chunks {
+		visible, tools := buf.consume(c)
+		totalVisible.WriteString(visible)
+		totalTools = append(totalTools, tools...)
+	}
+	for _, tc := range buf.flush() {
+		totalTools = append(totalTools, tc)
+	}
+
+	t.Logf("visible=%q", totalVisible.String())
+	for i, tc := range totalTools {
+		t.Logf("tool[%d]: name=%q args=%v", i, tc.Function.Name, tc.Function.Arguments)
+	}
+
+	if got := totalVisible.String(); strings.Contains(got, "DSML") {
+		t.Errorf("DSML marker leaked into visible text: %q", got)
+	}
+	if got := totalVisible.String(); strings.Contains(got, "<|") {
+		t.Errorf("DSML opener leaked into visible text: %q", got)
+	}
+	if got := totalVisible.String(); strings.Contains(got, "<tool") {
+		t.Errorf("tool wrapper leaked into visible text: %q", got)
+	}
+	if len(totalTools) == 0 {
+		t.Fatalf("expected at least one tool call, got 0; visible=%q", totalVisible.String())
+	}
+	if got := totalTools[0].Function.Name; got != "Bash" {
+		t.Errorf("expected tool name %q, got %q", "Bash", got)
+	}
+	if got := totalTools[0].Function.Arguments; got == nil {
+		t.Errorf("expected non-nil arguments, got nil")
+	} else if argsStr, ok := got.(string); !ok {
+		t.Errorf("expected JSON-string args, got %T", got)
+	} else if !strings.Contains(argsStr, "ls -la") {
+		t.Errorf("expected args to contain command=\"ls -la\", got %q", argsStr)
+	}
+}

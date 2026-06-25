@@ -158,6 +158,192 @@ func normalizeDSMLPipe(s string) string {
 	return strings.ReplaceAll(s, "｜", "|")
 }
 
+// normalizeMalformedDSMLTags repairs a few common malformations
+// the Xunfei WSS gateway produces when the upstream DeepSeek
+// tokeniser drops the closing ">" of a DSML tag. The malformed
+// forms seen in production (oneapi-2026.06.23-10.49.log, seq 10-58):
+//
+//   * <|DSML|tool_calls|\n   →  <|DSML|tool_calls>\n
+//     (the trailing "|" is a typo; the model wrote the
+//     wrapper open as if it were a close tag — drop the "|" and
+//     close the open tag with ">")
+//   * <|DSML|invoke name="X"  →  <|DSML|invoke name="X">
+//   * <|DSML|parameter name="X" ...value  →
+//     <|DSML|parameter name="X">...value
+//   * </|DSML|tool_calls|>  →  </|DSML|tool_calls>
+//     (the trailing "|" is a typo; the model wrote the
+//     close tag with a duplicate "|" — drop the extra "|")
+//
+// Without this fix the streaming parser sees "<|DSML|tool_calls|"
+// and treats it as literal text (no matching ">"), so the
+// tool-call opener is never recognised and the entire block is
+// emitted as visible prose. The function is a no-op on
+// well-formed DSML; only malformed tags are touched.
+//
+// The repair is intentionally conservative — it only fires when
+// the model emits the canonical opener prefix followed by a
+// name attribute (or the wrapper open with whitespace/newline/EOF
+// after it) and a ">" is NOT already present. This avoids
+// touching any user-content strings.
+func normalizeMalformedDSMLTags(s string) string {
+	if !strings.Contains(s, dsmlOpenPrefix) {
+		return s
+	}
+	// Wrapper open: <|DSML|tool_calls| ... → <|DSML|tool_calls>...
+	s = repairDSMLOpenTag(s, "<|DSML|tool_calls")
+	// Invoke open: <|DSML|invoke name="X"  →  <|DSML|invoke name="X">
+	s = repairDSMLOpenTag(s, "<|DSML|invoke")
+	// Parameter open: <|DSML|parameter name="X" ...value →
+	//                 <|DSML|parameter name="X">...value
+	s = repairDSMLOpenTag(s, "<|DSML|parameter")
+	// Wrapper close: </|DSML|tool_calls|>  →  </|DSML|tool_calls>
+	// (extra trailing pipe)
+	s = strings.ReplaceAll(s, "</|DSML|tool_calls|>", "</|DSML|tool_calls>")
+	return s
+}
+
+// repairDSMLOpenTag finds the next occurrence of opener in s that
+// does NOT already have a closing ">" and inserts one. Returns s
+// unchanged if opener is not present, all occurrences are
+// well-formed, or the tag opener is incomplete (the model is
+// mid-token; inserting ">" now would corrupt the attribute).
+//
+// The malformed forms seen in production:
+//   * "<|DSML|tool_calls|"  →  "<|DSML|tool_calls>"  (trailing |)
+//   * "<|DSML|tool_calls|\n"  →  "<|DSML|tool_calls>\n"  (trailing | + newline)
+//   * "<|DSML|invoke name=\"X\""  →  "<|DSML|invoke name=\"X\">"
+//     (no closing >, the model finished the attribute string)
+//   * "<|DSML|parameter name=\"X\" string=\"true\"" (no >)  →
+//     "<|DSML|parameter name=\"X\" string=\"true\">"
+//   * "<|DSML|parameter name=\"X\"<value>" (no >, no space
+//     between attribute and value)  →
+//     "<|DSML|parameter name=\"X\"><value>"  (the value is the
+//     next thing after the closing quote of the last attribute)
+//
+// For "in flight" cases (the buffer holds a tag opener that
+// hasn't yet seen its closing >), we leave it alone — the
+// streaming buffer will accumulate more bytes on the next frame
+// and the repair will run again with the complete tag.
+//
+// "Well-formed" check: a tag with a ">" anywhere inside it is
+// left alone (we don't re-pair attributes).
+//
+// "In-quote" tracking: while inside a double-quoted attribute
+// value, whitespace and "|" are part of the value and don't end
+// the tag. This prevents "<|DSML|parameter name=\"a b\">" from
+// being mis-repaired at the space inside the quoted value.
+//
+// Insertion-point selection: when the tag is incomplete (no
+// closing ">"), we walk forward tracking quote state. The
+// insertion point is the FIRST of:
+//   - A `|` (typo for `>`): drop the `|`, insert `>` there.
+//   - An unquoted whitespace: insert `>` there IF we've seen
+//     a closing `"` (i.e., the last attribute is complete).
+//   - End of buffer: append `>` at the end IF we've seen a
+//     closing `"` (i.e., the last attribute is complete).
+//   - Otherwise, the tag opener is incomplete (we haven't seen
+//     any attribute values complete yet); leave it for the
+//     next frame.
+func repairDSMLOpenTag(s, opener string) string {
+	for {
+		idx := strings.Index(s, opener)
+		if idx < 0 {
+			return s
+		}
+		end := idx + len(opener)
+		// Well-formed check: if there's a ">" anywhere after the
+		// opener BEFORE the next "<", the tag is complete;
+		// advance past it and look for the next opener. The
+		// "before next <" guard is what makes us correctly
+		// identify an opener like
+		// "<|DSML|parameter name=\"X\"<value></|DSML|parameter>"
+		// as MALFORMED — its `>` belongs to the close tag,
+		// not to the open tag, so we need to insert one for
+		// the open tag first.
+		closeIdx := strings.Index(s[end:], ">")
+		openIdx := strings.Index(s[end:], "<")
+		if closeIdx >= 0 && (openIdx < 0 || closeIdx < openIdx) {
+			s = s[:end+closeIdx+1] + repairDSMLOpenTag(s[end+closeIdx+1:], opener)
+			return s
+		}
+		// No ">". Walk forward tracking quote state, looking for
+		// the end of the tag opener.
+		//
+		// The end is the first unquoted terminator (whitespace or
+		// "|") AFTER the last complete attribute (i.e. after
+		// we've seen a closing `"`). Terminators BEFORE the first
+		// closing `"` are between the opener and the first
+		// attribute (or between attributes), and don't end the
+		// tag.
+		absClose, inQuote, lastQuoteClose := -1, false, -1
+		for j := end; j < len(s); j++ {
+			c := s[j]
+			if c == '"' {
+				inQuote = !inQuote
+				if !inQuote {
+					lastQuoteClose = j
+					// Reset absClose: any terminator seen
+					// before this closing quote was inside
+					// the attribute value (which we now know
+					// is complete). The next terminator
+					// will be a real tag boundary.
+					absClose = -1
+				}
+				continue
+			}
+			if inQuote {
+				continue
+			}
+			// Before the first closing `"`, terminators are
+			// between the opener and the first attribute, or
+			// between attributes — don't treat them as the
+			// end of the tag.
+			if lastQuoteClose < 0 {
+				continue
+			}
+			if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '|' {
+				absClose = j
+				break
+			}
+		}
+		// We need a complete last attribute (closing `"` seen) to
+		// know where to insert ">". If we never saw a closing
+		// `"`, the tag opener is incomplete — the model is still
+		// emitting the attribute value (e.g. we have
+		// "<|DSML|parameter name=\"" and the next frame may
+		// complete it to "<|DSML|parameter name=\"command\"").
+		// In that case, leave the buffer alone.
+		if lastQuoteClose < 0 {
+			return s
+		}
+		// Pick the insertion point:
+		//   - If we found a `|`, drop it and insert `>` there
+		//     (handles "<|DSML|tool_calls|").
+		//   - Else if we found an unquoted whitespace, insert `>`
+		//     there (handles "<|DSML|invoke name=\"X\" <rest>"
+		//     where the whitespace is between attributes).
+		//   - Else (no terminator at all, but the last attribute
+		//     is closed): append ">" at the end of the buffer
+		//     (handles "<|DSML|invoke name=\"X\"" arriving in
+		//     a single chunk).
+		if absClose < 0 {
+			// Last attribute closed, no terminator, no ">".
+			// The tag opener is complete-but-missing-">". Append
+			// ">" at the end of the buffer.
+			s = s + ">"
+			return s
+		}
+		if s[absClose] == '|' {
+			// Drop the "|", insert ">".
+			s = s[:absClose] + ">" + s[absClose+1:]
+		} else {
+			s = s[:absClose] + ">" + s[absClose:]
+		}
+		s = s[:absClose+1] + repairDSMLOpenTag(s[absClose+1:], opener)
+		return s
+	}
+}
+
 // extractXMLToolCalls parses the given content for fully-closed XML/DSML
 // blocks that look like a tool invocation, and returns them as
 // model.Tool slices. DSML blocks are emitted by DeepSeek models and look
@@ -167,6 +353,7 @@ func normalizeDSMLPipe(s string) string {
 // still picked up as a fallback.
 func extractXMLToolCalls(content string) []model.Tool {
 	content = normalizeDSMLPipe(content)
+	content = normalizeMalformedDSMLTags(content)
 	if toolCalls := extractDSMLToolCalls(content); len(toolCalls) > 0 {
 		return toolCalls
 	}
@@ -585,11 +772,26 @@ func StreamHandler(c *gin.Context, meta *meta.Meta, textRequest model.GeneralOpe
 	return nil, &usage
 }
 
-// streamXMLBuffer tracks the partial state of XML tool-call tags across
-// streaming frames so we know when a fully-closed block has been emitted
-// and can convert it to a function_call.
+// streamXMLBuffer holds the "in-flight" content across WSS frames:
+// any partial DSML prefix, full DSML block, or full plain XML tool
+// block that started arriving but hasn't yet been emitted (either
+// because the close tag hasn't arrived, or because the
+// boundary-detection pass found a partial prefix at the end of the
+// last chunk). The buffer runs extractFromBuffer on the combined
+// (held + new chunk) content and keeps whatever the extractor
+// returns as the new held tail. This guarantees that:
+//   - DSML markup (partial or complete) is never emitted as
+//     visible prose — it's always either parsed as a tool call
+//     (when the close arrives) or held in the buffer for the next
+//     chunk to disambiguate.
+//   - Plain XML tool blocks (e.g. <tools>...</tools>) are
+//     suppressed the same way DSML is, and parsed at end-of-stream
+//     or when the close arrives.
+//   - The extractor is the single source of truth for what counts
+//     as "in-flight" content, so the buffer does not duplicate
+//     that logic.
 type streamXMLBuffer struct {
-	accumulated string
+	held string
 }
 
 func newStreamXMLBuffer() *streamXMLBuffer {
@@ -602,88 +804,77 @@ func newStreamXMLBuffer() *streamXMLBuffer {
 // was holding. The visible text is discarded because the client has
 // already seen everything up to the last frame.
 func (b *streamXMLBuffer) flush() []model.Tool {
-	if b.accumulated == "" {
+	if b.held == "" {
 		return nil
 	}
-	_, toolCalls, _ := extractFromBufferImpl(b.accumulated, false)
-	b.accumulated = ""
+	// Parse the held tail in complete-buffer mode (holdTail=false)
+	// so any unmatched opening tag (e.g. <tools> with no </tools>)
+	// is processed in the same call rather than being held again.
+	_, toolCalls := extractCompleteBuffer(b.held)
+	b.held = ""
 	return toolCalls
 }
 
-// consume appends the new chunk and returns:
-//   - visibleText: the part of the chunk that is NOT inside a tool-call
-//     block, safe to send to the client as content.
-//   - toolCalls: tool calls that completed inside this chunk.
+// consume appends the new chunk to the held tail, runs the
+// extractor, and returns the visible text and any tool calls the
+// extractor found in this chunk. The extractor's holdTail
+// (extractFromBuffer with holdTail=true) is the single source of
+// truth for what is safe to emit vs what must be held.
 //
-// XML tag state is tracked by counting the most recent unmatched opening
-// tag; once a closing tag of the same name arrives, the block is treated
-// as a complete tool call and removed from visibleText.
+// We do a partial-DSML-prefix lookahead on the new chunk before
+// running the extractor: the model tokeniser splits "<|DSML|..."
+// across many frames (e.g. one frame ends with "<", the next is
+// "|", then "DS", then "ML|..."). The extractor doesn't know
+// about partial prefixes — it only sees the combined
+// (held + chunk) content — so without this lookahead, a chunk
+// ending in "<" would be emitted as visible text and the user
+// would see DSML markup leaking in. The fix: if the chunk ends
+// with a non-empty prefix of "<|DSML|", we hold the tail of the
+// chunk and run the extractor on held + chunk[:splitIdx] only.
 func (b *streamXMLBuffer) consume(chunk string) (visibleText string, toolCalls []model.Tool) {
 	if chunk == "" {
 		return "", nil
 	}
-	// Normalise fullwidth pipes to halfwidth so the DSML prefix
-	// detection and the extractor can use a single set of constants.
+	// Canonicalise fullwidth pipes (some DeepSeek-V3 outputs use ｜)
+	// to halfwidth so the rest of the parser matches a single set
+	// of constants.
 	chunk = normalizeDSMLPipe(chunk)
 
-	// Look ahead: if this chunk's end is part of a DSML marker, hold
-	// the tail so the next chunk can complete it. Specifically: walk
-	// backwards from the end of `chunk` looking for the start of a
-	// potential "<｜DSML｜" sequence. If we find a partial DSML marker
-	// (e.g. just "<" or "<｜DSML｜t"), split the chunk and keep the
-	// tail for the next call.
+	// Partial-prefix lookahead. findDSMLBoundary returns the byte
+	// index where the trailing partial DSML prefix starts in
+	// chunk, or -1 if there is no such prefix.
 	if splitIdx := findDSMLBoundary(chunk); splitIdx >= 0 {
-		// The chunk's tail is the start of a potential DSML
-		// marker (held for next call). Everything up to splitIdx is
-		// safe prose — except that b.accumulated + chunk[:splitIdx]
-		// may have just completed a DSML opening tag (wrapper
-		// <｜DSML｜tool_calls> or opener <｜DSML｜invoke ...>). If so,
-		// move the opener to b.accumulated so it stays attached to
-		// the held tail and the DSML extractor can pair it with
-		// the matching closing tag on a later call.
-		visibleText = b.accumulated + chunk[:splitIdx]
-		b.accumulated = chunk[splitIdx:]
-		stripped, opener, ok := extractTrailingDSMLOpener(visibleText)
-		if ok {
-			visibleText = stripped
-			b.accumulated = opener + b.accumulated
-		}
-		return visibleText, nil
+		// Combine held with the safe part of chunk, run the
+		// extractor on that, and hold the partial prefix.
+		combined := b.held + chunk[:splitIdx]
+		combined = normalizeMalformedDSMLTags(combined)
+		visibleText, toolCalls, b.held = extractFromBuffer(combined)
+		// Append the partial prefix to whatever the extractor
+		// left in b.held. The prefix is at most len(dsmlOpenPrefix)
+		// bytes long, so this is cheap.
+		b.held = b.held + chunk[splitIdx:]
+		return visibleText, toolCalls
 	}
 
-	b.accumulated += chunk
-
-	// After accumulation, check the buffer for an in-flight DSML
-	// block. We look for any "<|DSML" prefix (the model
-	// tokeniser splits the marker across frames, so the trailing
-	// "|" may not have arrived yet) AND not yet have a
-	// </|DSML|invoke> close. Holding the tail here is what keeps
-	// partial DSML markers from being emitted as visible prose.
-	dsmlOpenIdx := strings.Index(b.accumulated, dsmlOpenPrefix)
-	dsmlInvokeCloseIdx := strings.Index(b.accumulated, dsmlClosePrefix+"invoke>")
-	if dsmlOpenIdx >= 0 && (dsmlInvokeCloseIdx < 0 || dsmlInvokeCloseIdx <= dsmlOpenIdx) {
-		// Flush any prose that appeared before the DSML opening tag.
-		visibleText = b.accumulated[:dsmlOpenIdx]
-		b.accumulated = b.accumulated[dsmlOpenIdx:]
-		return visibleText, nil
+	// No partial prefix in chunk. Run the extractor on the full
+	// combined content, but first check if the COMBINED buffer
+	// ends with a non-empty prefix of "<|DSML|" — the partial
+	// prefix may be split across the boundary between b.held
+	// (which ended with "<") and chunk (which started with "|").
+	// Without this check, the extractor would see "<|" and emit
+	// the "<" as visible prose (since "<" by itself isn't a tag
+	// start), leaking DSML markup into the chat.
+	combined := b.held + chunk
+	combined = normalizeMalformedDSMLTags(combined)
+	if partialStart, ok := findTrailingPartialDSML(combined); ok {
+		// Run the extractor on everything BEFORE the partial
+		// prefix, then hold the partial prefix in the buffer.
+		safe := combined[:partialStart]
+		visibleText, toolCalls, tail := extractFromBuffer(safe)
+		b.held = tail + combined[partialStart:]
+		return visibleText, toolCalls
 	}
-	// Partial DSML prefix in flight: the buffer ends with a
-	// non-empty prefix of "<|DSML|" but doesn't yet contain the
-	// full opener. The model can split the marker across many
-	// frames (e.g. one frame ends with "<", the next is "|" or
-	// "DS" or "ML|"), so we must hold the tail for any prefix
-	// length from 1 char up to dsmlOpenPrefix. Without this check
-	// the buffer would emit "<|" or "<|D" as visible prose and
-	// the user would see the DSML markup leaking into the chat.
-	if partialStart, ok := findTrailingPartialDSML(b.accumulated); ok && dsmlInvokeCloseIdx < 0 {
-		visibleText = b.accumulated[:partialStart]
-		b.accumulated = b.accumulated[partialStart:]
-		return visibleText, nil
-	}
-
-	// DSML block is complete (or no DSML in flight). Run the
-	// regular extractor.
-	visibleText, toolCalls, b.accumulated = extractFromBuffer(b.accumulated)
+	visibleText, toolCalls, b.held = extractFromBuffer(combined)
 	return visibleText, toolCalls
 }
 
@@ -717,43 +908,6 @@ func findTrailingPartialDSML(s string) (int, bool) {
 		}
 	}
 	return 0, false
-}
-
-// extractTrailingDSMLOpener finds a complete DSML opening tag at the
-// end of s (ignoring trailing whitespace) and returns the visible
-// text up to (but not including) the opener, the opener itself, and
-// a found flag. Wrappers like <｜DSML｜tool_calls> are stripped from
-// visible (they are containers, not content); the opener is
-// returned so the caller can prepend it to the next-chunk held tail.
-// When no complete DSML opener is at the end, returns (s, "", false).
-func extractTrailingDSMLOpener(s string) (string, string, bool) {
-	// Find the rightmost '>' in s, ignoring trailing whitespace.
-	end := len(s)
-	for end > 0 && (s[end-1] == ' ' || s[end-1] == '\n' || s[end-1] == '\t' || s[end-1] == '\r') {
-		end--
-	}
-	if end == 0 || s[end-1] != '>' {
-		return s, "", false
-	}
-	gt := strings.LastIndex(s[:end], ">")
-	openIdx := strings.LastIndex(s[:gt], "<")
-	if openIdx < 0 {
-		return s, "", false
-	}
-	tag := s[openIdx : gt+1]
-	if !strings.HasPrefix(tag, dsmlOpenPrefix) {
-		return s, "", false
-	}
-	// Wrapper tag (e.g. <｜DSML｜tool_calls>): drop entirely, do not
-	// preserve as opener. Caller will see visible text without the
-	// wrapper and no opener attached.
-	if !strings.Contains(tag, "invoke ") {
-		return s[:openIdx], "", true
-	}
-	// Real tool opener (e.g. <｜DSML｜invoke name="Read">): keep in
-	// b.accumulated so the DSML extractor can pair it with the
-	// matching </｜DSML｜invoke> close.
-	return s[:openIdx], tag, true
 }
 
 // findDSMLBoundary returns the byte index in chunk where a partial
@@ -855,6 +1009,7 @@ func extractCompleteBuffer(buf string) (string, []model.Tool) {
 
 func extractFromBufferImpl(buf string, holdTail bool) (string, []model.Tool, string) {
 	buf = normalizeDSMLPipe(buf)
+	buf = normalizeMalformedDSMLTags(buf)
 	// DSML blocks (DeepSeek tool calls) take priority: they start with
 	// "<|DSML|" — a halfwidth pipe after the prompt we inject, but
 	// some DeepSeek-V3 outputs use a fullwidth "｜" pipe. The
