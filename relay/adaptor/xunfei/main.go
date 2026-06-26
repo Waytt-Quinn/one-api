@@ -32,23 +32,7 @@ import (
 // https://www.xfyun.cn/doc/spark/Web.html
 
 func requestOpenAI2Xunfei(request model.GeneralOpenAIRequest, xunfeiAppId string, domain string) *ChatRequest {
-	messages := make([]Message, 0, len(request.Messages)+1)
-	if len(request.Tools) > 0 {
-		// Inject the ds2api-style tool-call format instructions as
-		// the FIRST system message. ds2api's prompt is the de-facto
-		// reference for getting DeepSeek-class models to emit
-		// machine-parseable tool calls on gateways that don't do
-		// the conversion for us; the Xunfei WSS path needs it
-		// because the gateway hands back raw text. The prompt uses
-		// halfwidth pipes (|) which is also the form our parser
-		// now canonicalises to (normalizeDSMLPipe folds the
-		// fullwidth ｜ form some DeepSeek-V3 outputs use).
-		messages = append(messages, Message{
-			Role:        "system",
-			Content:     dsmlToolCallInstructions(toolNamesOf(request.Tools)),
-			ContentType: "text",
-		})
-	}
+	messages := make([]Message, 0, len(request.Messages))
 	for _, message := range request.Messages {
 		messages = append(messages, Message{
 			Role:        message.Role,
@@ -751,13 +735,6 @@ func StreamHandler(c *gin.Context, meta *meta.Meta, textRequest model.GeneralOpe
 			usage.TotalTokens += xunfeiResponse.Payload.Usage.Text.TotalTokens
 			response := streamResponseXunfei2OpenAI(&xunfeiResponse, streamBuf)
 			jsonResponse, err := json.Marshal(response)
-			// DEBUG: log the OpenAI SSE chunk so we can verify the
-			// model is being converted to delta.tool_calls. The
-			// [one-api VERSION] prefix matches the request/response
-			// log format added in e7e43db / d5f5f55.
-			if err == nil {
-				logger.SysLog(fmt.Sprintf("xunfei openai chunk [one-api %s]: %s", common.Version, string(jsonResponse)))
-			}
 			if err != nil {
 				logger.SysError("error marshalling stream response: " + err.Error())
 				return true
@@ -1249,9 +1226,6 @@ func xunfeiMakeRequest(textRequest model.GeneralOpenAIRequest, domain, authUrl, 
 		return nil, nil, err
 	}
 	data := requestOpenAI2Xunfei(textRequest, appId, domain)
-	// DEBUG: log the WSS payload so we can see exactly what the
-	// gateway receives. Useful for diagnosing tool-calling
-	// behaviour when the model emits unexpected XML shapes.
 	if payloadJSON, marshalErr := json.Marshal(data); marshalErr == nil {
 		logger.SysLog(fmt.Sprintf("xunfei wss request [one-api %s]: %s", common.Version, string(payloadJSON)))
 	}
@@ -1281,7 +1255,6 @@ func xunfeiMakeRequest(textRequest model.GeneralOpenAIRequest, domain, authUrl, 
 				logger.SysError("error unmarshalling stream response: " + err.Error())
 				break
 			}
-			// DEBUG: log the raw WSS response payload.
 			logger.SysLog(fmt.Sprintf("xunfei wss response [one-api %s]: %s", common.Version, string(msg)))
 			msg = nil
 			dataChan <- response
@@ -1297,74 +1270,4 @@ func xunfeiMakeRequest(textRequest model.GeneralOpenAIRequest, domain, authUrl, 
 	}()
 
 	return dataChan, stopChan, nil
-}
-
-// toolNamesOf extracts the function name from each model.Tool, in
-// the order they were declared. Used to render concrete tool names
-// in the DSML prompt's example blocks.
-func toolNamesOf(tools []model.Tool) []string {
-	names := make([]string, 0, len(tools))
-	for _, t := range tools {
-		if t.Function.Name != "" {
-			names = append(names, t.Function.Name)
-		}
-	}
-	return names
-}
-
-// dsmlToolCallInstructions returns a system-prompt block that
-// instructs the model to emit tool calls using the DSML format that
-// ds2api (DeepSeek-to-OpenAI bridge) and our parser both understand.
-// Ported from ds2api's internal/toolcall/tool_prompt.go so the
-// Xunfei WSS path gets the same prompt that works there.
-//
-// Halfwidth pipes (|) are used; the parser normalises the fullwidth
-// form (some DeepSeek-V3 outputs) to halfwidth before matching.
-func dsmlToolCallInstructions(toolNames []string) string {
-	const header = `TOOL CALL FORMAT — FOLLOW EXACTLY:
-
-<|DSML|tool_calls>
-  <|DSML|invoke name="TOOL_NAME">
-    <|DSML|parameter name="PARAMETER_NAME">VALUE</|DSML|parameter>
-  </|DSML|invoke>
-</|DSML|tool_calls>
-
-RULES:
-1) Use the <|DSML|tool_calls> wrapper format.
-2) Put one or more <|DSML|invoke> entries under a single <|DSML|tool_calls> root.
-3) Put the tool name in the invoke name attribute: <|DSML|invoke name="TOOL_NAME">.
-4) Every top-level argument must be a <|DSML|parameter name="ARG_NAME">VALUE</|DSML|parameter> node.
-5) Use only the parameter names in the tool schema. Do not invent fields.
-6) Fill parameters with the actual values required for this call.
-7) If a required parameter value is unknown, answer normally instead of outputting an empty tool call.
-8) Do NOT wrap XML in markdown fences. Do NOT output explanations or internal monologue around the tool block.
-9) The first non-whitespace characters of the tool block must be exactly <|DSML|tool_calls>.
-10) Never omit the opening <|DSML|tool_calls> tag.
-11) Compatibility note: the runtime also accepts the legacy XML tags <tool_calls> / <invoke> / <parameter>, but prefer the DSML-prefixed form above.
-
-When you are NOT calling a tool, just answer normally with prose. Do not emit empty <|DSML|tool_calls></|DSML|tool_calls> wrappers.
-`
-	return header + dsmlExampleBlock(toolNames)
-}
-
-// dsmlExampleBlock renders a single positive example using the
-// first non-empty tool name from names. The example shows the
-// minimal correct format with one parameter.
-func dsmlExampleBlock(names []string) string {
-	for _, n := range names {
-		if n == "" {
-			continue
-		}
-		var b strings.Builder
-		b.WriteString("\nEXAMPLE:\n")
-		b.WriteString("<|DSML|tool_calls>\n")
-		b.WriteString("  <|DSML|invoke name=\"")
-		b.WriteString(n)
-		b.WriteString("\">\n")
-		b.WriteString("    <|DSML|parameter name=\"ARG_NAME\">VALUE</|DSML|parameter>\n")
-		b.WriteString("  </|DSML|invoke>\n")
-		b.WriteString("</|DSML|tool_calls>\n")
-		return b.String()
-	}
-	return ""
 }
