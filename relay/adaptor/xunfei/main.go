@@ -186,48 +186,29 @@ func normalizeMalformedDSMLTags(s string) string {
 	return s
 }
 
-// repairDSMLOpenTag finds the next occurrence of opener in s that
-// does NOT already have a closing ">" and inserts one. Returns s
-// unchanged if opener is not present, all occurrences are
-// well-formed, or the tag opener is incomplete (the model is
-// mid-token; inserting ">" now would corrupt the attribute).
+// repairDSMLOpenTag finds the next occurrence of opener in s
+// and repairs it if it's missing a closing ">". Returns s
+// unchanged if opener is not present or the tag is well-formed.
 //
-// The malformed forms seen in production:
-//   * "<|DSML|tool_calls|"  →  "<|DSML|tool_calls>"  (trailing |)
-//   * "<|DSML|tool_calls|\n"  →  "<|DSML|tool_calls>\n"  (trailing | + newline)
+// The malformed forms seen in production (oneapi log seq 10-58):
+//   * "<|DSML|tool_calls|"   →  "<|DSML|tool_calls>"
+//     (model wrote `|` instead of `>`)
+//   * "<|DSML|tool_calls|\n"  →  "<|DSML|tool_calls>\n"
 //   * "<|DSML|invoke name=\"X\""  →  "<|DSML|invoke name=\"X\">"
-//     (no closing >, the model finished the attribute string)
-//   * "<|DSML|parameter name=\"X\" string=\"true\"" (no >)  →
-//     "<|DSML|parameter name=\"X\" string=\"true\">"
-//   * "<|DSML|parameter name=\"X\"<value>" (no >, no space
-//     between attribute and value)  →
-//     "<|DSML|parameter name=\"X\"><value>"  (the value is the
-//     next thing after the closing quote of the last attribute)
+//   * "<|DSML|parameter name=\"X\"<value>"  →
+//     "<|DSML|parameter name=\"X\"><value>"
+//     (model dropped the `>` and concatenated the value
+//     directly after the attribute)
 //
-// For "in flight" cases (the buffer holds a tag opener that
-// hasn't yet seen its closing >), we leave it alone — the
-// streaming buffer will accumulate more bytes on the next frame
-// and the repair will run again with the complete tag.
+// Well-formed: if the opener has a `>` anywhere before the
+// next `<`, it's complete. We advance past it.
 //
-// "Well-formed" check: a tag with a ">" anywhere inside it is
-// left alone (we don't re-pair attributes).
-//
-// "In-quote" tracking: while inside a double-quoted attribute
-// value, whitespace and "|" are part of the value and don't end
-// the tag. This prevents "<|DSML|parameter name=\"a b\">" from
-// being mis-repaired at the space inside the quoted value.
-//
-// Insertion-point selection: when the tag is incomplete (no
-// closing ">"), we walk forward tracking quote state. The
-// insertion point is the FIRST of:
-//   - A `|` (typo for `>`): drop the `|`, insert `>` there.
-//   - An unquoted whitespace: insert `>` there IF we've seen
-//     a closing `"` (i.e., the last attribute is complete).
-//   - End of buffer: append `>` at the end IF we've seen a
-//     closing `"` (i.e., the last attribute is complete).
-//   - Otherwise, the tag opener is incomplete (we haven't seen
-//     any attribute values complete yet); leave it for the
-//     next frame.
+// Malformed: if the opener has no `>`, walk forward tracking
+// quote state. Insert `>` at the FIRST `<` we encounter (or
+// at the end of buffer if no `<` follows). The value is
+// whatever's between the closing `"` of the last attribute
+// and the inserted `>`. extractDSMLParameters trims
+// surrounding whitespace.
 func repairDSMLOpenTag(s, opener string) string {
 	for {
 		idx := strings.Index(s, opener)
@@ -237,93 +218,51 @@ func repairDSMLOpenTag(s, opener string) string {
 		end := idx + len(opener)
 		// Well-formed check: if there's a ">" anywhere after the
 		// opener BEFORE the next "<", the tag is complete;
-		// advance past it and look for the next opener. The
-		// "before next <" guard is what makes us correctly
-		// identify an opener like
-		// "<|DSML|parameter name=\"X\"<value></|DSML|parameter>"
-		// as MALFORMED — its `>` belongs to the close tag,
-		// not to the open tag, so we need to insert one for
-		// the open tag first.
+		// advance past it and look for the next opener.
 		closeIdx := strings.Index(s[end:], ">")
 		openIdx := strings.Index(s[end:], "<")
 		if closeIdx >= 0 && (openIdx < 0 || closeIdx < openIdx) {
 			s = s[:end+closeIdx+1] + repairDSMLOpenTag(s[end+closeIdx+1:], opener)
 			return s
 		}
-		// No ">". Walk forward tracking quote state, looking for
-		// the end of the tag opener.
-		//
-		// The end is the first unquoted terminator (whitespace or
-		// "|") AFTER the last complete attribute (i.e. after
-		// we've seen a closing `"`). Terminators BEFORE the first
-		// closing `"` are between the opener and the first
-		// attribute (or between attributes), and don't end the
-		// tag.
-		absClose, inQuote, lastQuoteClose := -1, false, -1
-		for j := end; j < len(s); j++ {
+		// No ">". Find the closing `"` of the last attribute
+		// (within this opener's scope, before the next `<`).
+		walkEnd := len(s)
+		if nextOpen := strings.Index(s[end:], "<"); nextOpen >= 0 {
+			walkEnd = end + nextOpen
+		}
+		inQuote := false
+		lastQuoteClose := -1
+		for j := end; j < walkEnd; j++ {
 			c := s[j]
 			if c == '"' {
 				inQuote = !inQuote
 				if !inQuote {
 					lastQuoteClose = j
-					// Reset absClose: any terminator seen
-					// before this closing quote was inside
-					// the attribute value (which we now know
-					// is complete). The next terminator
-					// will be a real tag boundary.
-					absClose = -1
 				}
-				continue
-			}
-			if inQuote {
-				continue
-			}
-			// Before the first closing `"`, terminators are
-			// between the opener and the first attribute, or
-			// between attributes — don't treat them as the
-			// end of the tag.
-			if lastQuoteClose < 0 {
-				continue
-			}
-			if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '|' {
-				absClose = j
-				break
 			}
 		}
-		// We need a complete last attribute (closing `"` seen) to
-		// know where to insert ">". If we never saw a closing
-		// `"`, the tag opener is incomplete — the model is still
-		// emitting the attribute value (e.g. we have
-		// "<|DSML|parameter name=\"" and the next frame may
-		// complete it to "<|DSML|parameter name=\"command\"").
-		// In that case, leave the buffer alone.
+		// If we never saw a closing `"` within the opener's
+		// scope, the tag opener is incomplete (the model is
+		// still emitting an attribute value). Leave the buffer
+		// alone — the next frame will complete it.
 		if lastQuoteClose < 0 {
 			return s
 		}
-		// Pick the insertion point:
-		//   - If we found a `|`, drop it and insert `>` there
-		//     (handles "<|DSML|tool_calls|").
-		//   - Else if we found an unquoted whitespace, insert `>`
-		//     there (handles "<|DSML|invoke name=\"X\" <rest>"
-		//     where the whitespace is between attributes).
-		//   - Else (no terminator at all, but the last attribute
-		//     is closed): append ">" at the end of the buffer
-		//     (handles "<|DSML|invoke name=\"X\"" arriving in
-		//     a single chunk).
-		if absClose < 0 {
-			// Last attribute closed, no terminator, no ">".
-			// The tag opener is complete-but-missing-">". Append
-			// ">" at the end of the buffer.
-			s = s + ">"
-			return s
+		// Insert ">" immediately after the last closing `"` of
+		// the last attribute. The model may have written the
+		// value with or without a separating space after the
+		// attribute (`<|DSML|parameter name="X">v</...>` or
+		// `<|DSML|parameter name="X"v</...>`); the value is
+		// whatever follows, and extractDSMLParameters trims
+		// surrounding whitespace.
+		insertAt := lastQuoteClose + 1
+		if insertAt >= len(s) {
+			// Append ">" at the end of the buffer.
+			return s + ">"
 		}
-		if s[absClose] == '|' {
-			// Drop the "|", insert ">".
-			s = s[:absClose] + ">" + s[absClose+1:]
-		} else {
-			s = s[:absClose] + ">" + s[absClose:]
-		}
-		s = s[:absClose+1] + repairDSMLOpenTag(s[absClose+1:], opener)
+		s = s[:insertAt] + ">" + s[insertAt:]
+		s = s + repairDSMLOpenTag(s[insertAt+1:], opener)
 		return s
 	}
 }
